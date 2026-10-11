@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Agent Duet Workbench · Claude × Codex 双人协作开发工作台</title>
+<link rel="stylesheet" href="/styles.css" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'><rect width='40' height='40' rx='11' fill='%234d6bfe'/><circle cx='15.5' cy='20' r='10' fill='%23fff' fill-opacity='.5'/><circle cx='24.5' cy='20' r='10' fill='%23fff' fill-opacity='.5'/></svg>" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<!-- 字体加载不到就回落到系统字体（font stack 里排好了），不阻塞渲染、也不影响离线使用 -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&display=swap" />
+<script>
+  /* 在首次绘制之前定好主题，避免浅色闪一下再变深色。
+     这里必须和 app.js 里的解析规则保持一致：auto 直接解析成 light/dark。 */
+  (function () {
+    try {
+      var pref = localStorage.getItem('agent-duet-workbench-theme') || 'auto';
+      var dark = pref === 'dark' ||
+        (pref === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+      document.documentElement.dataset.themePref = pref;
+    } catch (e) {
+      document.documentElement.dataset.theme = 'light';
+    }
+  })();
+</script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">
+      <!-- 两个相交的圆（vesica piscis）：相交处自然更亮，形成透镜形。
+           这个几何本身就是「二重奏 / 两个声音交融」的经典符号，
+           比两个并排的圆点有意图得多。 -->
+      <svg width="20" height="20" viewBox="0 0 40 40">
+        <circle cx="15.5" cy="20" r="10" fill="currentColor" fill-opacity=".5" />
+        <circle cx="24.5" cy="20" r="10" fill="currentColor" fill-opacity=".5" />
+      </svg>
+    </span>
+    <div class="brand-text">
+      <div class="brand-name">Agent Duet<span class="brand-name-alt">Workbench</span></div>
+      <div class="brand-sub">Claude × Codex 双人协作开发工作台</div>
+    </div>
+  </div>
+
+  <div class="agents-status" id="agentsStatus">
+    <div class="chip" data-agent="claude"><span class="dot"></span><b>Claude</b><span class="chip-note">检查中…</span></div>
+    <div class="chip" data-agent="codex"><span class="dot"></span><b>Codex</b><span class="chip-note">检查中…</span></div>
+  </div>
+
+  <div class="topbar-actions">
+    <button class="btn icon" id="btnTheme" title="切换主题（自动 / 浅色 / 深色）" aria-label="切换主题">
+      <span id="themeIcon">◐</span>
+    </button>
+    <button class="btn ghost" id="btnToggleHistory">历史</button>
+    <button class="btn ghost" id="btnNew">新讨论</button>
+  </div>
+</header>
+
+<div class="layout">
+
+  <!-- 历史侧栏 -->
+  <aside class="sidebar" id="sidebar" hidden>
+    <div class="sidebar-head">历史会话</div>
+    <div class="session-list" id="sessionList"></div>
+  </aside>
+
+  <main class="main">
+
+    <!-- 新建面板 -->
+    <section class="setup" id="setupView">
+      <div class="setup-card">
+        <h1>把这个需求交给他们两个</h1>
+        <p class="hint">
+          两个不同的模型组队：各自先拿出方案，再补对方没看到的地方，
+          合出一份比任何一方单独做都稳的，然后动手实现、互相把关 ——
+          你原来靠复制粘贴做的事，这里全自动。
+        </p>
+
+        <label class="field">
+          <span class="label">你要做什么</span>
+          <textarea id="requirement" rows="7" placeholder="例：把这个落地页改到能直接投广告的程度：首屏必须在 3 秒内说清卖点，移动端不能有横向滚动，转化按钮要能在折叠线以上看到。"></textarea>
+        </label>
+
+        <label class="field">
+          <span class="label">项目目录</span>
+          <div class="row">
+            <input id="projectDir" type="text" placeholder="/path/to/your/project" />
+            <button class="btn" id="btnPickFolder">选择…</button>
+          </div>
+          <span class="sub" id="dirHint">他们会读写这个目录里的文件；开始前会自动打一个 git 检查点。</span>
+        </label>
+
+        <details class="advanced">
+          <summary>高级设置</summary>
+          <div class="adv-grid">
+            <label class="field">
+              <span class="label">讨论轮数上限</span>
+              <input id="maxRounds" type="number" min="1" max="8" value="4" />
+              <span class="sub">达到上限即使没谈拢也会进入定稿</span>
+            </label>
+            <label class="field">
+              <span class="label">第 1 轮之后由谁主导实现</span>
+              <select id="leadAgent">
+                <option value="claude">Claude 实现，Codex 验收</option>
+                <option value="codex">Codex 实现，Claude 验收</option>
+                <option value="split">分工实现：两人各写一部分（依次动手）</option>
+                <option value="auto">由讨论决定：他们商量完再定谁做、要不要分工</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="label">写入权限</span>
+              <select id="allowWrite">
+                <option value="true">允许直接改代码（有 git 检查点兜底）</option>
+                <option value="false">只讨论出方案，不动文件</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="label">实现阶段的授权级别</span>
+              <select id="sandbox">
+                <option value="workspace">可写项目 + 可联网装依赖（推荐）</option>
+                <option value="full">完全不限（可改项目之外的任何文件）</option>
+              </select>
+              <span class="sub">讨论阶段始终只读。装依赖需要联网，默认档已开。</span>
+            </label>
+            <label class="field">
+              <span class="label">返工上限</span>
+              <input id="maxFixRounds" type="number" min="0" max="4" value="2" />
+              <span class="sub">验收打回后最多重做几次</span>
+            </label>
+          </div>
+        </details>
+
+        <div class="setup-actions">
+          <button class="btn primary" id="btnStart">开始讨论</button>
+          <span class="sub" id="startHint"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 会话视图 -->
+    <section class="session" id="sessionView" hidden>
+
+      <div class="session-head">
+        <div class="session-title">
+          <div class="req-text" id="sessionReq"></div>
+          <div class="session-meta" id="sessionMeta"></div>
+        </div>
+        <div class="session-controls">
+          <button class="btn" id="btnGuidance">插一句话</button>
+          <button class="btn danger" id="btnStop">中止</button>
+          <button class="btn" id="btnRollback" hidden>回滚到基线</button>
+        </div>
+      </div>
+
+      <!-- 阶段路线：节点 + 连接线。已完成打勾、当前脉冲、未开始留空。
+           比原来五个孤立的胶囊能读出「走到哪了」。 -->
+      <div class="phases" id="phases">
+        <div class="phase" data-phase="propose">
+          <span class="phase-node"></span>
+          <span class="phase-label">独立作答<span class="phase-round"></span></span>
+        </div>
+        <div class="phase" data-phase="discuss">
+          <span class="phase-node"></span>
+          <span class="phase-label">交叉讨论<span class="phase-round"></span></span>
+        </div>
+        <div class="phase" data-phase="finalize">
+          <span class="phase-node"></span>
+          <span class="phase-label">方案定稿<span class="phase-round"></span></span>
+        </div>
+        <div class="phase" data-phase="execute">
+          <span class="phase-node"></span>
+          <span class="phase-label">动手实现<span class="phase-round"></span></span>
+        </div>
+        <div class="phase" data-phase="review">
+          <span class="phase-node"></span>
+          <span class="phase-label">交叉验收<span class="phase-round"></span></span>
+        </div>
+      </div>
+
+      <!-- 成本看板：这场讨论花了多少、跑了多少轮 -->
+      <div class="stats" id="sessionStats" hidden></div>
+
+      <!-- 会话级日志：为什么停下来、追加了几轮、有没有报错。
+           不显示的话这些信息只存在于事件文件里，界面上完全看不到。 -->
+      <div class="session-log" id="sessionLog" hidden></div>
+
+      <div class="board">
+        <div class="column" data-agent="claude">
+          <div class="column-head"><span class="dot"></span>Claude <span class="col-status" id="statusClaude"></span></div>
+          <div class="column-body" id="colClaude"></div>
+        </div>
+        <div class="column" data-agent="codex">
+          <div class="column-head"><span class="dot"></span>Codex <span class="col-status" id="statusCodex"></span></div>
+          <div class="column-body" id="colCodex"></div>
+        </div>
+      </div>
+
+      <div class="lower">
+        <div class="panel" id="consensusPanel">
+          <div class="panel-head">共识状态 <span class="badge" id="consensusBadge">等待中</span></div>
+          <!-- 收敛曲线：把「他们从分歧走向一致」这个过程画出来 -->
+          <div class="convergence" id="convergence" hidden></div>
+          <div class="panel-body" id="consensusBody">
+            <div class="empty">双方给出第一轮结论后会显示在这里。</div>
+          </div>
+        </div>
+
+        <div class="panel" id="planPanel">
+          <div class="panel-head">定稿方案</div>
+          <div class="panel-body markdown" id="planBody">
+            <div class="empty">讨论收敛后生成。</div>
+          </div>
+        </div>
+
+        <div class="panel" id="diffPanel">
+          <div class="panel-head">
+            代码改动
+            <span class="badge" id="diffBadge"></span>
+            <button class="btn tiny" id="btnRefreshDiff">刷新</button>
+          </div>
+          <div class="panel-body">
+            <div class="filelist" id="fileList"></div>
+            <pre class="diff" id="diffBody"><span class="empty">尚未产生改动。</span></pre>
+          </div>
+        </div>
+      </div>
+
+    </section>
+  </main>
+</div>
+
+<div class="modal" id="guidanceModal" hidden role="dialog" aria-modal="true" aria-labelledby="guidanceTitle">
+  <div class="modal-card">
+    <div class="modal-head" id="guidanceTitle">插一句话</div>
+    <p class="sub">这句话会在下一轮讨论时交给双方，用来纠偏或补充要求。</p>
+    <textarea id="guidanceText" rows="4" placeholder="例：别用外部 CDN，全部内联；移动端优先。"></textarea>
+    <div class="modal-actions">
+      <button class="btn" id="btnGuidanceCancel">取消</button>
+      <button class="btn primary" id="btnGuidanceSend">发送</button>
+    </div>
+  </div>
+</div>
+
+<!-- aria-live：否则所有通知（中止结果、插话回执、验收打回…）对屏幕阅读器完全静默 -->
+<div class="toast-wrap" id="toastWrap" role="status" aria-live="polite"></div>
+
+<div class="modal" id="confirmModal" hidden role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+  <div class="modal-card">
+    <div class="modal-head" id="confirmTitle">确认</div>
+    <p class="sub" id="confirmText"></p>
+    <div class="modal-actions">
+      <button class="btn" id="btnConfirmNo">取消</button>
+      <button class="btn primary" id="btnConfirmYes">确定</button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js" type="module"></script>
+</body>
+</html>

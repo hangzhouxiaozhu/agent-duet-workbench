@@ -1,0 +1,20 @@
+{
+  "name": "agent-duet-workbench",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Claude × Codex 双人讨论台 —— 让两个 agent 独立作答、互相评议、收敛成方案，然后动手实现",
+  "type": "module",
+  "bin": {
+    "agent-duet-workbench": "./bin/agent-duet-workbench.mjs"
+  },
+  "scripts": {
+    "start": "node bin/agent-duet-workbench.mjs",
+    "doctor": "node bin/agent-duet-workbench.mjs doctor",
+    "test": "node --test test/*.test.mjs",
+    "test:ui": "node test/ui-check.mjs",
+    "shots": "node test/screenshots.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

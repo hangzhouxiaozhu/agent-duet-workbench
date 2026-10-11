@@ -1,0 +1,13 @@
+# Local session history may contain prompts, transcripts, and machine-specific paths
+sessions/
+
+# Local dependencies and OS/editor artifacts
+node_modules/
+.DS_Store
+*.log
+
+# Local credentials/configuration
+.env
+.env.*
+!.env.example
+.npmrc
