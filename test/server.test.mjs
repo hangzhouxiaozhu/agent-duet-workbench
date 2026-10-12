@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 
 /**
  * 服务层的测试。
@@ -19,7 +19,8 @@ process.env.AGENT_DUET_WORKBENCH_SESSIONS_DIR = path.join(tmp, 'sessions');
 
 // 必须先设好环境变量再动态导入：config.mjs 在导入时就读取它
 const store = await import('../src/session.mjs');
-const { reconcileOrphanSessions } = await import('../src/server.mjs');
+const { reconcileOrphanSessions, createServer } = await import('../src/server.mjs');
+const { runSession, stopSession } = await import('../src/orchestrator.mjs');
 
 const make = (status, id) => store.createSession({
   id,
@@ -379,4 +380,171 @@ test('readEvents 与 readEventsWithStats 给出的一致（含 afterTs 过滤）
   assert.equal(store.readEvents(id).length, 3);
   assert.equal(store.readEventsWithStats(id).events.length, 3);
   assert.equal(store.readEvents(id, { afterTs: 2000 }).length, 2, 'afterTs 过滤仍要生效');
+});
+
+test('rollback rejects a live session and succeeds after it stops', async () => {
+  const project = fs.mkdtempSync(path.join(tmp, 'rollback-proj-'));
+  const git = (...args) => execFileSync('git', args, { cwd: project, encoding: 'utf8' }).trim();
+  const original = path.join(project, 'index.html');
+  fs.writeFileSync(original, 'before session\n');
+  git('init', '-q');
+  git('add', '-A');
+  git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'base');
+
+  const id = store.createSession({
+    id: 'rollback-live', requirement: '测试运行中回滚保护', projectDir: project,
+    settings: { maxRounds: 1, minRounds: 1, allowWrite: false, leadAgent: 'claude' },
+    status: 'created',
+  }).id;
+  let releaseReady;
+  const ready = new Promise((resolve) => { releaseReady = resolve; });
+  const adapter = {
+    async run({ signal }) {
+      if (signal.aborted) return { ok: false, aborted: true, error: 'aborted' };
+      return new Promise((resolve) => signal.addEventListener(
+        'abort', () => resolve({ ok: false, aborted: true, error: 'aborted' }), { once: true },
+      ));
+    },
+  };
+  const server = createServer({ port: 0 });
+  let run;
+  try {
+    await new Promise((resolve) => server.once('listening', resolve));
+    const base = `http://127.0.0.1:${server.address().port}`;
+    run = runSession({
+      sessionId: id, requirement: '测试运行中回滚保护', projectDir: project,
+      settings: { maxRounds: 1, minRounds: 1, allowWrite: false, leadAgent: 'claude' },
+      adapters: { claude: adapter, codex: adapter },
+      onEvent: (event) => { if (event.type === 'turn.start') releaseReady(); },
+    });
+    await ready;
+    const baseSha = store.readMeta(id).baseSha;
+    assert.ok(baseSha, '会话启动时应建立 git 基线');
+
+    fs.writeFileSync(original, 'agent is still writing\n');
+    const blocked = await fetch(`${base}/api/sessions/${id}/rollback`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sha: baseSha }),
+    });
+    assert.equal(blocked.status, 409);
+    assert.equal(fs.readFileSync(original, 'utf8'), 'agent is still writing\n', '运行中的文件不能被回滚改写');
+
+    stopSession(id);
+    await run;
+    const allowed = await fetch(`${base}/api/sessions/${id}/rollback`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sha: baseSha }),
+    });
+    assert.equal(allowed.status, 200, await allowed.text());
+    assert.equal(fs.readFileSync(original, 'utf8'), 'before session\n', '停止后应能恢复到检查点');
+  } finally {
+    stopSession(id);
+    if (run) await run.catch(() => {});
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+test('追加需求与验收：运行中一律 409，停止后才放行', async () => {
+  const project = fs.mkdtempSync(path.join(tmp, 'continue-proj-'));
+  const git = (...args) => execFileSync('git', args, { cwd: project, encoding: 'utf8' }).trim();
+  fs.writeFileSync(path.join(project, 'index.html'), 'base\n');
+  git('init', '-q');
+  git('add', '-A');
+  git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'base');
+
+  const id = store.createSession({
+    id: 'continue-guard', requirement: '第一轮需求', projectDir: project,
+    settings: { maxRounds: 1, minRounds: 1, allowWrite: false, leadAgent: 'claude' },
+    status: 'created',
+  }).id;
+
+  let releaseReady;
+  const ready = new Promise((resolve) => { releaseReady = resolve; });
+  const adapter = {
+    async run({ signal }) {
+      if (signal.aborted) return { ok: false, aborted: true, error: 'aborted' };
+      return new Promise((resolve) => signal.addEventListener(
+        'abort', () => resolve({ ok: false, aborted: true, error: 'aborted' }), { once: true },
+      ));
+    },
+  };
+  const server = createServer({ port: 0 });
+  let run;
+  try {
+    await new Promise((resolve) => server.once('listening', resolve));
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const post = (p, body) => fetch(`${base}${p}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+
+    run = runSession({
+      sessionId: id, requirement: '第一轮需求', projectDir: project,
+      settings: { maxRounds: 1, minRounds: 1, allowWrite: false, leadAgent: 'claude' },
+      adapters: { claude: adapter, codex: adapter },
+      onEvent: (event) => { if (event.type === 'turn.start') releaseReady(); },
+    });
+    await ready;
+
+    // 还在跑的时候既不能追加需求也不能验收：否则用户会写到一个写到一半的状态上
+    assert.equal((await post(`/api/sessions/${id}/continue`, { text: '新需求' })).status, 409);
+    assert.equal((await post(`/api/sessions/${id}/complete`)).status, 409);
+
+    stopSession(id);
+    await run;
+
+    // 路由确实存在（不是被通用 404 兜住）：未知会话给出的是「会话不存在」
+    const missing = await post('/api/sessions/does-not-exist/continue', { text: 'x' });
+    assert.equal(missing.status, 404);
+    assert.match((await missing.json()).error, /不存在/);
+
+    // 空需求要被挡住，而且不该顺手把会话改成 running
+    const empty = await post(`/api/sessions/${id}/continue`, { text: '   ' });
+    assert.equal(empty.status, 400);
+    assert.equal(store.readMeta(id).status, 'stopped');
+
+    // 验收：这是「已完成」唯一的来源。
+    // （追加需求的成功路径会真的去调 CLI、烧额度，所以只在这里验证它的守卫；
+    //   续跑的编排行为由 orchestrator.test.mjs 的用例覆盖。）
+    const done = await post(`/api/sessions/${id}/complete`);
+    assert.equal(done.status, 200, await done.text());
+    const meta = store.readMeta(id);
+    assert.equal(meta.status, 'completed');
+    assert.equal(meta.awaitingUser, false);
+    assert.equal(meta.confirmedBy, 'user');
+    assert.ok(meta.confirmedAt, '要记录是谁在什么时候验收的');
+    assert.equal(store.readEvents(id).some((e) => e.type === 'session.confirmed'), true);
+  } finally {
+    stopSession(id);
+    if (run) await run.catch(() => {});
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+test('插话在会话停下时也会被收下（不再返回「未在运行」）', async () => {
+  const project = fs.mkdtempSync(path.join(tmp, 'guidance-proj-'));
+  const id = store.createSession({
+    id: 'guidance-queue', requirement: '需求', projectDir: project,
+    settings: {}, status: 'interrupted',
+  }).id;
+  const server = createServer({ port: 0 });
+  try {
+    await new Promise((resolve) => server.once('listening', resolve));
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const post = (p, body) => fetch(`${base}${p}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+
+    const r = await post(`/api/sessions/${id}/guidance`, { text: '上线前先备份' });
+    assert.equal(r.status, 200);
+    assert.equal((await r.json()).queued, true);
+    assert.deepEqual(store.readMeta(id).pendingGuidance, ['上线前先备份']);
+    assert.equal(store.readEvents(id).some((e) => e.type === 'guidance.queued'), true);
+
+    assert.equal((await post(`/api/sessions/${id}/guidance`, { text: '   ' })).status, 400);
+    const missing = await post('/api/sessions/nope/guidance', { text: 'x' });
+    assert.equal(missing.status, 404);
+    assert.match((await missing.json()).error, /不存在/);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });

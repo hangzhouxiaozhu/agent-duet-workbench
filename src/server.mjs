@@ -382,13 +382,111 @@ export function createServer({ port = DEFAULTS.port } = {}) {
       if (stop && req.method === 'POST') {
         return json(res, 200, stopSession(decodeURIComponent(stop[1])));
       }
+      /* ---------------- 追加需求：同一个会话接着做 ----------------
+       *
+       * 「任务做完了没有」由用户说了算。所以自动化流程跑完只把会话标成 delivered，
+       * 用户随时可以在这里追加新要求，带着上次的方案接着做 —— 而不是被迫新开一个会话、
+       * 或者对着一个点不动的界面发愁。
+       */
+      const cont = pathname.match(/^\/api\/sessions\/([^/]+)\/continue$/);
+      if (cont && req.method === 'POST') {
+        const id = decodeURIComponent(cont[1]);
+        const meta = store.readMeta(id);
+        if (!meta) return json(res, 404, { error: '会话不存在' });
+        if (getRuntime(id)) return json(res, 409, { error: '这个会话还在跑，等它停下来再追加需求' });
+        const body = await readBody(req);
+        const text = String(body.text || '').trim();
+        if (!text) return json(res, 400, { error: '缺少需求描述' });
+        const bins = getBins();
+        if (!bins.claude || !bins.codex) {
+          return json(res, 400, {
+            error: `缺少 CLI：${!bins.claude ? 'claude ' : ''}${!bins.codex ? 'codex' : ''}`,
+          });
+        }
+
+        const cycle = (Number(meta.cycle) || 1) + 1;
+        const priorContext = {
+          cycle,
+          previousRequirement: meta.requirement,
+          // 上次交付的方案是这次最重要的背景：没有它，追加需求等于从零再来一遍
+          previousPlan: store.readPlan(id),
+          previousOutcome: meta.outcome || null,
+        };
+        store.patchMeta(id, {
+          cycle,
+          continuations: [...(meta.continuations || []), { text, at: new Date().toISOString() }],
+        });
+        // 时间线里要看得见这次追加了什么，否则标题永远停在第一次的需求上
+        const added = store.appendEvent(id, { sessionId: id, cycle, type: 'requirement', text });
+        broadcast(added);
+
+        const settings = { ...DEFAULTS, ...(meta.settings || {}) };
+        const adapters = {
+          claude: createClaudeAdapter({ bin: bins.claude, model: settings.claudeModel }),
+          codex: createCodexAdapter({ bin: bins.codex, model: settings.codexModel }),
+        };
+        // 先回执再开跑：界面立刻能切到这个会话并连上 SSE
+        json(res, 200, { ok: true, id, cycle });
+        runSession({
+          sessionId: id,
+          requirement: text,
+          projectDir: meta.projectDir,
+          settings,
+          adapters,
+          onEvent: broadcast,
+          cycle,
+          priorContext,
+          resumeIds: meta.agentSessions || null,
+        }).catch((err) => {
+          broadcast({ sessionId: id, type: 'error', text: err.message });
+        });
+        return;
+      }
+
+      /* ---------------- 用户验收：由用户宣布任务结束 ---------------- */
+      const complete = pathname.match(/^\/api\/sessions\/([^/]+)\/complete$/);
+      if (complete && req.method === 'POST') {
+        const id = decodeURIComponent(complete[1]);
+        const meta = store.readMeta(id);
+        if (!meta) return json(res, 404, { error: '会话不存在' });
+        if (getRuntime(id)) return json(res, 409, { error: '这个会话还在跑，等它停下来再验收' });
+        const at = new Date().toISOString();
+        store.patchMeta(id, {
+          status: 'completed',
+          phase: 'completed',
+          awaitingUser: false,
+          confirmedAt: at,
+          confirmedBy: 'user',
+        });
+        const record = store.appendEvent(id, { sessionId: id, type: 'session.confirmed', at, by: 'user' });
+        broadcast(record);
+        return json(res, 200, { ok: true, id, confirmedAt: at });
+      }
 
       /* ---------------- 中途插话 ---------------- */
       const guide = pathname.match(/^\/api\/sessions\/([^/]+)\/guidance$/);
       if (guide && req.method === 'POST') {
+        const id = decodeURIComponent(guide[1]);
         const body = await readBody(req);
-        if (!body.text) return json(res, 400, { error: '缺少 text' });
-        return json(res, 200, injectGuidance(decodeURIComponent(guide[1]), body.text));
+        const text = String(body.text || '').trim();
+        if (!text) return json(res, 400, { error: '缺少 text' });
+        /* 会话在跑 → 交给当前编排，下一个发言机会生效。
+         * 已经停下 → 存进 meta，下次继续时第一件事就交给双方。
+         *
+         * 以前这里只会回「会话未在运行」，界面上那颗按钮于是永远是灰的 ——
+         * 用户刚打的一段话没有地方去。插话属于「不能被静默丢掉」的那类输入，
+         * 所以会话停下也要收下。 */
+        const live = injectGuidance(id, text);
+        if (live.ok) return json(res, 200, live);
+        const meta = store.readMeta(id);
+        if (!meta) return json(res, 404, { error: '会话不存在' });
+        const pending = [...(meta.pendingGuidance || []), text];
+        store.patchMeta(id, { pendingGuidance: pending });
+        const record = store.appendEvent(id, {
+          sessionId: id, type: 'guidance.queued', text, pending: pending.length,
+        });
+        broadcast(record);
+        return json(res, 200, { ok: true, queued: true, pending: pending.length });
       }
 
       /* ---------------- 回滚 ---------------- */
@@ -397,6 +495,10 @@ export function createServer({ port = DEFAULTS.port } = {}) {
         const id = decodeURIComponent(rollback[1]);
         const meta = store.readMeta(id);
         if (!meta) return json(res, 404, { error: '会话不存在' });
+        // Agent 还在写文件时回滚会与后续写入竞争，造成“回滚成功”但工作区又变化。
+        if (getRuntime(id)) {
+          return json(res, 409, { error: '这个会话还在运行，请先「中止」并等待停止后再回滚' });
+        }
         const body = await readBody(req);
         const sha = body.sha || meta.baseSha;
         const result = gitguard.rollbackTo(meta.projectDir, sha);

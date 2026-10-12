@@ -55,6 +55,15 @@ export function createCodexAdapter({ bin, model }) {
         onStderr: (text) => {
           const trimmed = text.trim();
           if (!trimmed) return;
+          // 这是 Codex CLI 自己刷新模型目录时的网络超时，不等同于本轮生成失败。
+          // 单独降级为提示，避免生成仍正常时在会话日志里显示成致命红错。
+          if (isModelRefreshTimeout(trimmed)) {
+            onEvent?.({
+              type: 'warning',
+              text: 'Codex CLI 刷新可用模型列表超时，通常与网络/API/代理连接有关；这条提示本身不代表本轮生成失败。若没有后续回复，请检查连接后重试。',
+            });
+            return;
+          }
           // codex 会把 PATH alias 之类的噪音写到 stderr，只在像错误时上报
           if (/error|failed|denied|panic/i.test(trimmed)) {
             onEvent?.({ type: 'stderr', text: trimmed.slice(0, 2000) });
@@ -200,6 +209,13 @@ const BENIGN_ERROR = /under-development features|suppress_unstable_features_warn
 /** 导出来是为了能被单元测试钉住：codex 的"假错误"必须和真错误区分开。 */
 export function isBenignCodexError(text) {
   return BENIGN_ERROR.test(String(text || ''));
+}
+
+const MODEL_REFRESH_TIMEOUT = /codex_models_manager::manager:\s*failed to refresh available models:\s*request timed out/i;
+
+/** Codex CLI 的模型目录刷新超时只影响模型发现，不必然代表当前生成失败。 */
+export function isModelRefreshTimeout(text) {
+  return MODEL_REFRESH_TIMEOUT.test(String(text || ''));
 }
 
 function handleItem(ev, onEvent, setFinal, setError) {

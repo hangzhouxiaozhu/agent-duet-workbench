@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { runStreaming, killAllChildren, liveChildCount, describeToolInput, oneLine } from '../src/adapters/util.mjs';
-import { isBenignCodexError, buildNewArgs, buildResumeArgs } from '../src/adapters/codex.mjs';
+import { isBenignCodexError, isModelRefreshTimeout, buildNewArgs, buildResumeArgs } from '../src/adapters/codex.mjs';
 import { looksLikeLimitNotice } from '../src/adapters/claude.mjs';
 
 /**
@@ -107,6 +107,12 @@ test('isBenignCodexError：认得启动横幅这类告警', () => {
     + 'To suppress this warning, set `suppress_unstable_features_warning = true` in ~/.codex/config.toml.';
   assert.equal(isBenignCodexError(banner), true, '启动横幅不该被当成失败原因');
   assert.equal(isBenignCodexError('suppress_unstable_features_warning = true'), true);
+});
+
+test('Codex 模型目录刷新超时能与本轮生成失败区分', () => {
+  assert.equal(isModelRefreshTimeout('ERROR codex_models_manager::manager: failed to refresh available models: request timed out'), true);
+  assert.equal(isModelRefreshTimeout('request timed out while generating response'), false);
+  assert.equal(isModelRefreshTimeout('authentication failed: invalid token'), false);
 });
 
 test('isBenignCodexError：真正的错误不能被误判成告警', () => {

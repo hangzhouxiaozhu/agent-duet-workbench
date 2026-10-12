@@ -225,6 +225,16 @@ export function readPlan(id) {
   }
 }
 
+/**
+ * 追加 transcript。
+ *
+ * 一个会话可以有多次需求（第 2 次起是用户追加的），每次都覆盖同一份 transcript
+ * 会把前几次的记录抹掉 —— 那正是用户最想回看的部分。
+ */
+export function appendTranscript(id, markdown) {
+  fs.appendFileSync(path.join(sessionDir(id), 'transcript.md'), markdown);
+}
+
 export function saveTranscript(id, markdown) {
   fs.writeFileSync(path.join(sessionDir(id), 'transcript.md'), markdown);
 }

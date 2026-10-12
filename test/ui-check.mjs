@@ -96,6 +96,33 @@ ev({ type: 'log', agent: 'codex', phase: 'discuss', round: 3, text: '这条是 a
 ev({ type: 'stderr', agent: 'codex', phase: 'discuss', round: 3, text: 'claude 退出码 143' });
 ev({ type: 'session.end', status: 'completed', outcome: 'done' });
 
+// 交付了但用户还没验收的会话：任务结束与否该由用户判定。
+// 所以这时「接着提需求」和「验收通过」都得可用，状态也不能写成「已完成」。
+const DELIVERED_ID = 'uitest-delivered';
+store.createSession({
+  id: DELIVERED_ID,
+  requirement: '把首屏改成能在 3 秒内说清卖点',
+  projectDir: project,
+  settings: { maxRounds: 3, leadAgent: 'claude', allowWrite: true },
+  status: 'delivered',
+  phase: 'delivered',
+  awaitingUser: true,
+  cycle: 2,
+  baseSha: BASE_SHA,
+  scopeNotice: null,
+});
+const evD = (e) => store.appendEvent(DELIVERED_ID, e);
+evD({ type: 'session.start', requirement: '把首屏改成能在 3 秒内说清卖点', projectDir: tmp, leadAgent: 'claude', peerAgent: 'codex' });
+evD({ type: 'session.end', status: 'delivered', outcome: 'done', awaitingUser: true });
+// 第 2 次需求：用户追加的话必须出现在时间线上，否则界面还停在第一次的需求上
+evD({ type: 'requirement', cycle: 2, text: '再把移动端的横向滚动修掉' });
+evD({ type: 'session.start', requirement: '再把移动端的横向滚动修掉', projectDir: tmp, cycle: 2 });
+evD({ type: 'phase', phase: 'propose', round: 1, cycle: 2, label: '独立作答' });
+evD({ type: 'turn.start', agent: 'claude', phase: 'propose', round: 1, cycle: 2 });
+evD({ type: 'message', agent: 'claude', phase: 'propose', round: 1, cycle: 2, text: '这次只动 CSS。' });
+evD({ type: 'turn.end', agent: 'claude', phase: 'propose', round: 1, cycle: 2, ok: true });
+evD({ type: 'session.end', status: 'delivered', outcome: 'done', awaitingUser: true, cycle: 2 });
+
 /* ---------- 2. 起一个隔离的服务 ---------- */
 
 const { createServer } = await import('../src/server.mjs');
@@ -233,9 +260,13 @@ await expect('再点「历史」侧栏收起', { sidebar: 'hidden' });
   const g = JSON.parse(await evaluate(`JSON.stringify({
     guidance: document.getElementById('btnGuidance').disabled,
     stop: document.getElementById('btnStop').disabled,
+    cont: document.getElementById('btnContinue').disabled,
+    complete: document.getElementById('btnComplete').hidden,
   })`));
   check('无会话时「插一句话」被禁用', g.guidance === true, `disabled=${g.guidance}`);
   check('无会话时「中止」被禁用', g.stop === true, `disabled=${g.stop}`);
+  check('无会话时「接着提需求」被禁用', g.cont === true, `disabled=${g.cont}`);
+  check('无会话时不显示「验收通过」', g.complete === true, `hidden=${g.complete}`);
 }
 
 // 切到会话视图。先清空提示区，好让下面「重放不该弹提示」的断言是确定的。
@@ -261,15 +292,73 @@ await expect('打开会话后：面板与弹窗都收起，会话可见', {
     t.count === 0, `弹了 ${t.count} 个：${JSON.stringify(t.texts)}`);
 }
 
-// 已结束的会话不该还能中止/插话
+// 已结束的会话：不能中止，但**插一句话必须还能用** ——
+// 会话停下来之后想把话补上是很自然的事，那颗按钮变灰等于把用户刚打的话丢掉。
 {
   const g = JSON.parse(await evaluate(`JSON.stringify({
     guidance: document.getElementById('btnGuidance').disabled,
     stop: document.getElementById('btnStop').disabled,
   })`));
-  check('已结束的会话：「中止」与「插一句话」都是禁用的',
-    g.stop === true && g.guidance === true, JSON.stringify(g));
+  check('已结束的会话：不能再中止，但插话仍然可用',
+    g.stop === true && g.guidance === false, JSON.stringify(g));
 }
+
+// 停下时的插话必须被收下并落盘（下次继续时交给双方），而不是回「会话未在运行」
+{
+  const r = await fetch(`${BASE}/api/sessions/${SESSION_ID}/guidance`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: '上线前记得先备份数据库' }),
+  }).then((x) => x.json());
+  check('已结束的会话：插话被记下来而不是被拒', r.ok === true && r.queued === true, JSON.stringify(r));
+  const pending = store.readMeta(SESSION_ID).pendingGuidance;
+  check('记下的话真的落盘了（下次继续时第一件事交给双方）',
+    Array.isArray(pending) && pending.includes('上线前记得先备份数据库'), JSON.stringify(pending));
+}
+
+// 停下时的插话弹窗要说清「只是先记下来」，否则用户以为按了就有人看
+await evaluate(`document.getElementById('btnGuidance').click()`);
+await sleep(200);
+{
+  const hint = JSON.parse(await evaluate(`JSON.stringify({
+    text: document.getElementById('guidanceHint').textContent,
+    send: document.getElementById('btnGuidanceSend').textContent,
+  })`));
+  check('停下时插话弹窗说明了生效时机', hint.text.includes('接着提需求'), hint.text);
+  check('停下时按钮文案是「记下来」而不是「发送」', hint.send === '记下来', hint.send);
+  await evaluate(`document.getElementById('btnGuidanceCancel').click()`);
+}
+
+// 任务结束与否由用户判定：跑完了也一直能接着提需求，
+// 否则用户只能新开一个会话，把上下文全丢掉。
+{
+  const c = JSON.parse(await evaluate(`JSON.stringify({
+    continueDisabled: document.getElementById('btnContinue').disabled,
+    completeHidden: document.getElementById('btnComplete').hidden,
+  })`));
+  check('跑完之后仍然能「接着提需求」', c.continueDisabled === false, `disabled=${c.continueDisabled}`);
+  check('已经验收过的会话不再显示「验收通过」', c.completeHidden === true, `hidden=${c.completeHidden}`);
+}
+
+// 交付但还没验收的会话：状态要如实写成「待你确认」，而不是替你宣布「已完成」
+await evaluate(`location.hash = '#/s/${DELIVERED_ID}'`);
+await sleep(2000);
+{
+  const d = JSON.parse(await evaluate(`JSON.stringify({
+    pill: (document.querySelector('#sessionMeta .status-pill') || {}).textContent || '',
+    completeHidden: document.getElementById('btnComplete').hidden,
+    continueDisabled: document.getElementById('btnContinue').disabled,
+    reqStrip: document.getElementById('reqStrip').textContent,
+  })`));
+  check('交付后状态是「待你确认」，而不是替你宣布「已完成」',
+    d.pill.includes('待你确认'), `状态徽章是「${d.pill}」`);
+  check('追加的需求出现在时间线上',
+    d.reqStrip.includes('再把移动端的横向滚动修掉'), `需求区：${d.reqStrip}`);
+  check('交付后「接着提需求」可用', d.continueDisabled === false);
+  check('交付后「验收通过」可用（结束与否交给你）', d.completeHidden === false);
+}
+// 切回最初那个会话：后面的用例都在它上面跑
+await evaluate(`location.hash = '#/s/${SESSION_ID}'`);
+await sleep(2000);
 
 // 弹窗本身的显示/关闭逻辑（守着当初「.modal{display:flex} 盖过 hidden，
 // 弹窗永久遮挡整个界面」那个 bug）。这里强行启用按钮，只测弹窗行为。
@@ -478,6 +567,53 @@ await expect('侧栏展开', { sidebar: 'visible' });
     `实际：${JSON.stringify(sidebar.texts)}`);
   check('每条记录都有删除按钮', sidebar.delButtons === sidebar.count,
     `按钮 ${sidebar.delButtons} 个 / 记录 ${sidebar.count} 条`);
+}
+
+// 键盘事件必须只激活对应控件：Delete 按钮不能被父行的 Enter/Space 抢走。
+{
+  const initialHash = await evaluate('location.hash');
+  const press = async (key) => evaluate(`(() => {
+    const target = document.activeElement;
+    if (!target) return false;
+    target.dispatchEvent(new KeyboardEvent('keydown', { key: ${JSON.stringify(key)}, bubbles: true, cancelable: true }));
+    // DOM 合成键盘事件不会自动触发原生按钮 click，这里显式模拟其键盘激活默认动作。
+    target.click();
+    target.dispatchEvent(new KeyboardEvent('keyup', { key: ${JSON.stringify(key)}, bubbles: true }));
+    return true;
+  })()`);
+  for (const [key, code, keyCode] of [['Enter', 'Enter', 13], [' ', 'Space', 32]]) {
+    await evaluate(`(() => {
+      const row = [...document.querySelectorAll('.session-item')].find(el => el.textContent.includes('被中断的会话'));
+      const button = row?.querySelector('.si-del');
+      button?.focus();
+      return document.activeElement === button;
+    })()`);
+    await press(key);
+    await sleep(250);
+    const result = JSON.parse(await evaluate(`JSON.stringify({ hash: location.hash, confirmOpen: !document.getElementById('confirmModal').hidden })`));
+    check(`删除按钮按 ${key === ' ' ? 'Space' : key} 打开确认但不导航`,
+      result.confirmOpen && result.hash === initialHash, JSON.stringify(result));
+    await evaluate(`document.getElementById('btnConfirmNo').click()`);
+    await sleep(150);
+  }
+
+  await evaluate(`(() => {
+    const row = [...document.querySelectorAll('.session-item')].find(el => el.textContent.includes('被中断的会话'));
+    row?.focus();
+  })()`);
+  await press('Enter');
+  await sleep(700);
+  check('历史行按 Enter 仍可打开会话', (await evaluate('location.hash')) === `#/s/${DEAD_ID}`);
+
+  await evaluate(`location.hash = '#/s/${SESSION_ID}'`);
+  await sleep(900);
+  await evaluate(`(() => {
+    const row = [...document.querySelectorAll('.session-item')].find(el => el.textContent.includes('被中断的会话'));
+    row?.focus();
+  })()`);
+  await press(' ');
+  await sleep(700);
+  check('历史行按 Space 仍可打开会话', (await evaluate('location.hash')) === `#/s/${DEAD_ID}`);
 }
 
 // 真删一次。删除走自绘确认框（不用原生 confirm —— 被浏览器抑制时会静默失效）

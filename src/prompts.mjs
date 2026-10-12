@@ -168,7 +168,33 @@ export const REVIEW_VERDICT_INSTRUCTION = [
 /* 第一阶段：独立作答                                                    */
 /* ------------------------------------------------------------------ */
 
-export function proposePrompt({ agent, requirement, projectDir, round = 1 }) {
+export function continuationBlock(priorContext) {
+  if (!priorContext) return '';
+  const { previousRequirement, previousPlan, previousOutcome, cycle } = priorContext;
+  const req = String(previousRequirement || '').trim();
+  const plan = String(previousPlan || '').trim();
+  if (!req && !plan) return '';
+  const planShown = plan.length > 12000
+    ? plan.slice(0, 12000) + String.fromCharCode(10) + '…（方案过长已截断）'
+    : plan;
+  const parts = [
+    '',
+    '## 背景：这是第 ' + (cycle || 2) + ' 次需求（不是从零开始）',
+    '用户在这个项目上继续提了新要求。下面是**上一次**的需求和你们当时交付的方案。',
+    '新需求默认叠加在它之上：除非用户明确说要推翻，之前的结论和约束继续有效。',
+  ];
+  if (req) parts.push('', '### 上一次的需求', req);
+  if (planShown) parts.push('', '### 上次交付的方案', planShown);
+  if (previousOutcome) parts.push('', '上次交付的结局：' + previousOutcome);
+  parts.push(
+    '',
+    '**先核对项目里当前真实的代码状态**（上次的方案可能只实现了一部分），再针对新需求作答。',
+    '已经做完的部分不要重做；也不要把「上次说过」当成「现在已经是这样」。',
+  );
+  return parts.join(String.fromCharCode(10));
+}
+
+export function proposePrompt({ agent, requirement, projectDir, round = 1, priorContext = null }) {
   return [
     `你是 ${ROLE[agent]}。`,
     '',
@@ -183,6 +209,7 @@ export function proposePrompt({ agent, requirement, projectDir, round = 1 }) {
     '2. **方案** —— 按优先级列出改动点，写清涉及文件、行为变化，以及必要的接口/数据/错误处理。',
     '3. **验收方式** —— 给出能验证需求的测试或命令及预期结果；不要把“实现了”当作“验证通过”。',
     '4. **关键取舍与风险** —— 说明为何选此方案、舍弃什么，以及最可能的失败路径和应对办法。',
+    continuationBlock(priorContext),
     '',
     '## 需求',
     requirement,
@@ -305,7 +332,7 @@ export function discussPrompt({
 /* ------------------------------------------------------------------ */
 
 export function finalizePrompt({
-  agent, requirement, projectDir, transcriptDigest,
+  agent, requirement, projectDir, transcriptDigest, priorContext = null,
   openIssues = [], decisions = [], stalled = false, split = false,
 }) {
   const parts = [
@@ -317,6 +344,7 @@ export function finalizePrompt({
     '',
     '## 需求',
     requirement,
+    continuationBlock(priorContext),
     '',
     '## 讨论记录摘要',
     transcriptDigest,

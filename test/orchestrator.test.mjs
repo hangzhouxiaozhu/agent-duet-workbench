@@ -89,7 +89,9 @@ test('双方正常：走完 作答→讨论→定稿→实现→验收，会话�
   for (const p of ['propose', 'discuss', 'finalize', 'execute', 'review']) {
     assert.ok(phases.includes(p), `缺少阶段 ${p}（实际: ${phases.join(',')}）`);
   }
-  assert.equal(meta.status, 'completed');
+  // 跑完只代表「交付了」——任务算不算完成由用户点「验收通过」决定
+  assert.equal(meta.status, 'delivered');
+  assert.equal(meta.awaitingUser, true);
 
   // 第 1 轮两个都要被叫到
   assert.ok(claude.calls.length >= 1 && codex.calls.length >= 1);
@@ -687,4 +689,122 @@ test('由讨论决定：讨论提示词里要问 execution，其他模式不问'
   // 固定模式下不追加该指令（用 prompts 里是否有该段来判断）
   const anyAuto = auto.prompts.some((p) => /谁来落地/.test(p.prompt));
   assert.equal(anyAuto, true);
+});
+/* ---------------------- 追加需求：任务结束与否由用户判定 ---------------------- */
+
+/**
+ * 「任务做完了没有」应该由用户判定：自动化流程跑完只把会话标成 delivered，
+ * 用户还能接着提需求。这两个用例守住这条路径。
+ */
+test('追加需求：带上一次交付的方案，且每个 agent 的第一轮续聊 CLI 会话', async () => {
+  const project = makeProject('continue-ok');
+  const first = await run({ projectDir: project });
+  assert.equal(first.meta.status, 'delivered', '跑完只算交付，不该替用户宣布完成');
+  assert.equal(first.meta.awaitingUser, true);
+  const plan = store.readPlan(first.id);
+  assert.ok(plan.length > 0, '第一次交付应该留下方案，作为续跑的背景');
+
+  const seen = [];
+  const make = (agent) => ({
+    id: agent, label: agent,
+    async run({ prompt, resumeId, onEvent }) {
+      seen.push({ agent, prompt, resumeId });
+      const text = `续：${agent}\n\n${VERDICT}`;
+      onEvent?.({ type: 'message', text });
+      return { ok: true, text, sessionId: `sess-${agent}-cont` };
+    },
+  });
+
+  const result = await runSession({
+    sessionId: first.id,
+    requirement: '再把移动端的横向滚动修掉',
+    projectDir: project,
+    settings: { maxRounds: 2, minRounds: 1, allowWrite: false, maxFixRounds: 0, leadAgent: 'claude', turnTimeoutMs: 5000 },
+    adapters: { claude: make('claude'), codex: make('codex') },
+    onEvent: () => {},
+    cycle: 2,
+    priorContext: { cycle: 2, previousRequirement: '把首屏改到 3 秒内说清卖点', previousPlan: plan },
+    resumeIds: { claude: 'claude-old', codex: 'codex-old' },
+  });
+  assert.equal(result.ok, true, `续跑失败: ${result.error}`);
+
+  for (const agent of ['claude', 'codex']) {
+    const mine = seen.filter((s) => s.agent === agent);
+    assert.equal(mine[0].resumeId, `${agent}-old`, '第一轮应该续聊上次的 CLI 会话（它记得之前谈过什么）');
+    assert.match(mine[0].prompt, /移动端的横向滚动/, '提示词里要有这次的新需求');
+    assert.match(mine[0].prompt, /第 2 次需求/, '提示词里要说明这是追加需求，不是从零开始');
+    assert.ok(mine.slice(1).every((s) => !s.resumeId), '后续轮次仍然每轮给完整上下文，不该继续 resume');
+  }
+
+  const meta = store.readMeta(first.id);
+  assert.equal(meta.cycle, 2, '会话要记住这是第几次需求');
+  assert.equal(meta.status, 'delivered', '追加需求跑完仍然只是交付');
+  assert.equal(meta.awaitingUser, true, '交付后仍在等用户确认');
+});
+
+test('续聊会话失效时自动回退，不把用户刚提的需求丢掉', async () => {
+  const project = makeProject('continue-fallback');
+  const id = store.createSession({
+    requirement: '第二轮需求', projectDir: project,
+    settings: { maxRounds: 2, minRounds: 1, allowWrite: false, maxFixRounds: 0, leadAgent: 'claude', turnTimeoutMs: 5000 },
+    status: 'running',
+  }).id;
+
+  const events = [];
+  const make = (agent) => ({
+    id: agent, label: agent,
+    async run({ resumeId, onEvent }) {
+      if (resumeId) return { ok: false, error: 'session not found' };
+      const text = `补上方案。\n\n${VERDICT}`;
+      onEvent?.({ type: 'message', text });
+      return { ok: true, text, sessionId: `fresh-${agent}` };
+    },
+  });
+
+  const result = await runSession({
+    sessionId: id,
+    requirement: '第二轮需求',
+    projectDir: project,
+    settings: { maxRounds: 2, minRounds: 1, allowWrite: false, maxFixRounds: 0, leadAgent: 'claude', turnTimeoutMs: 5000 },
+    adapters: { claude: make('claude'), codex: make('codex') },
+    onEvent: (e) => events.push(e),
+    cycle: 2,
+    priorContext: { cycle: 2, previousRequirement: '第一轮需求', previousPlan: '旧方案' },
+    resumeIds: { claude: 'gone', codex: 'gone' },
+  });
+
+  assert.equal(result.ok, true, `回退后应该跑完: ${result.error}`);
+  const logged = events.filter((e) => e.type === 'log').map((e) => e.text || '').join(' ');
+  assert.match(logged, /续聊会话不可用/, '要如实告诉用户续聊失效并已回退，而不是静默失败');
+  assert.equal(store.readMeta(id).status, 'delivered');
+});
+test('会话停下时记下的插话，下次继续时第一件事就交给双方', async () => {
+  const project = makeProject('pending-guidance');
+  const id = store.createSession({
+    requirement: '老需求', projectDir: project,
+    settings: { maxRounds: 2, minRounds: 1, allowWrite: false, maxFixRounds: 0, leadAgent: 'claude', turnTimeoutMs: 5000 },
+    status: 'delivered',
+    pendingGuidance: ['上线前先备份数据库'],
+  }).id;
+
+  const prompts = [];
+  const make = (agent) => ({
+    id: agent, label: agent,
+    async run({ prompt, onEvent }) {
+      prompts.push(prompt);
+      const text = `收到。\n\n${VERDICT}`;
+      onEvent?.({ type: 'message', text });
+      return { ok: true, text, sessionId: `s-${agent}` };
+    },
+  });
+
+  const result = await runSession({
+    sessionId: id, requirement: '上线', projectDir: project,
+    settings: { maxRounds: 2, minRounds: 1, allowWrite: false, maxFixRounds: 0, leadAgent: 'claude', turnTimeoutMs: 5000 },
+    adapters: { claude: make('claude'), codex: make('codex') },
+    onEvent: () => {}, cycle: 2,
+  });
+  assert.equal(result.ok, true, `续跑失败: ${result.error}`);
+  assert.ok(prompts.some((p) => p.includes('上线前先备份数据库')), '第一轮的提示词里必须带上之前记下的插话');
+  assert.deepEqual(store.readMeta(id).pendingGuidance, [], '取用之后要清掉，不能反复塞同一句');
 });

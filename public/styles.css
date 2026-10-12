@@ -738,3 +738,16 @@ pre.diff .meta { color: var(--text-faint); display: block; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+
+/* ---------------------------------------------------------------- 追加的需求 */
+/* 第 2 次起的需求列在这里。看着像卡片而不是纯文本，
+   是因为它和页面顶部那条标题一样重要 —— 用户就是靠它确认自己又提了什么。 */
+.req-strip { display: flex; flex-direction: column; gap: var(--sp-3); margin-bottom: var(--sp-4); }
+.req-card {
+  border: 1px solid var(--border-subtle); border-left: 3px solid var(--brand);
+  border-radius: var(--r-input); padding: 10px 14px; background: var(--bg-subtle);
+}
+.req-card-head { font-size: 11.5px; color: var(--text-faint); margin-bottom: 5px; }
+.req-card-body { font-size: 13.5px; line-height: 1.65; color: var(--text-secondary); white-space: pre-wrap; }
+/* 停下时记下的一句话：用灰边和需求区分开，它还没被交付 */
+.req-card.note { border-left-color: var(--text-faint); border-style: dashed; border-left-style: solid; }

@@ -209,6 +209,8 @@ async function loadSessions() {
       el.setAttribute('aria-label', `打开会话：${s.requirement.slice(0, 60)}`);
       el.onclick = () => openSession(s.id);
       el.onkeydown = (e) => {
+        // 行内删除按钮是独立操作：键盘事件会冒泡到行，不能因此打开会话。
+        if (e.target !== el) return;
         if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openSession(s.id); }
       };
       el.querySelector('.si-del').onclick = async (e) => {
@@ -249,6 +251,8 @@ function showSetup() {
   $('sessionView').hidden = true;
   // 没有会话可插话，直接禁用比打开一个发不出去的弹窗更清楚
   $('btnGuidance').disabled = true;
+  $('btnContinue').disabled = true;
+  $('btnComplete').hidden = true;
   clearBusyStates();
   if (location.hash) history.replaceState(null, '', location.pathname);
   resetBoard();
@@ -268,9 +272,13 @@ function resetBoard() {
   $('fileList').innerHTML = '';
   $('diffBadge').textContent = '';
   $('btnRollback').hidden = true;
-  // 复位时两个操作按钮都该是禁用的；真正可用与否由 openSession 按 running 决定
+  $('reqStrip').innerHTML = '';
+  $('reqStrip').hidden = true;
+  // 复位时这些操作按钮都该是禁用的；真正可用与否由 openSession 按 running / status 决定
   $('btnStop').disabled = true;
   $('btnGuidance').disabled = true;
+  $('btnContinue').disabled = true;
+  $('btnComplete').hidden = true;
   $('sessionLog').innerHTML = '';
   $('sessionLog').hidden = true;
   state.reached = new Set();
@@ -351,6 +359,9 @@ function setPhase(active, done = [], round = null) {
  */
 const STATUS_TEXT = {
   running: '进行中',
+  // delivered = 这一轮自动化流程做完了，但**任务算不算完成由用户判定**。
+  // 所以它不叫「已完成」，也不锁死操作 —— 用户随时可以接着提需求。
+  delivered: '已交付 · 待你确认',
   completed: '已完成',
   stopped: '已中止',
   interrupted: '已中断',
@@ -360,6 +371,7 @@ const STATUS_TEXT = {
 
 const STATUS_STYLE = {
   running: 'run',
+  delivered: 'warn',
   completed: 'ok',
   stopped: 'dim',
   interrupted: 'warn',
@@ -385,7 +397,9 @@ function renderSessionMeta() {
   $('sessionMeta').innerHTML = [
     sessionStatusHtml(meta, state.running),
     `<span>目录 <code>${escapeHtml(meta.projectDir)}</code></span>`,
+    meta.cycle > 1 ? `<span>第 ${meta.cycle} 次需求</span>` : '',
     `<span>开始于 ${new Date(meta.createdAt).toLocaleString('zh-CN')}</span>`,
+    meta.confirmedAt ? `<span>你已验收 ${new Date(meta.confirmedAt).toLocaleString('zh-CN')}</span>` : '',
     meta.baseSha ? `<span>基线 <code>${String(meta.baseSha).slice(0, 8)}</code></span>` : '',
     meta.scopeNotice
       ? `<span class="scope-notice" title="${escapeHtml(meta.scopeNotice)}">⚠ 仓库子目录，改动已限定范围</span>`
@@ -439,8 +453,10 @@ async function openSession(id) {
     renderSessionMeta();
 
     $('btnStop').disabled = !data.running;
-    $('btnGuidance').disabled = !data.running;
-    $('btnRollback').hidden = !data.meta.baseSha;
+    // 插话在有会话时永远可用：会话停了也要能收下（会先记下来，下次继续时交给他们）
+    $('btnGuidance').disabled = false;
+    $('btnRollback').hidden = !data.meta.baseSha || data.running;
+    updateSessionActions(data.meta.status);
 
     // 重放历史事件，然后再挂实时流。
     // server 返回的是**合并过 delta** 的事件（一个 7000 事件的会话合并后只剩几百条），
@@ -529,7 +545,40 @@ function applyEvent(ev, replay = false) {
   switch (ev.type) {
     case 'session.start':
       state.running = true;
+      $('btnContinue').disabled = true;
+      $('btnComplete').hidden = true;
       break;
+
+    case 'requirement': {
+      // 用户追加的需求。标题只放得下第一次的需求，这里把后续的列出来。
+      const strip = $('reqStrip');
+      strip.hidden = false;
+      const card = document.createElement('div');
+      card.className = 'req-card';
+      const head = document.createElement('div');
+      head.className = 'req-card-head';
+      head.textContent = '第 ' + (ev.cycle || 2) + ' 次需求 · ' + fmtTime(ev.ts || Date.now());
+      const body = document.createElement('div');
+      body.className = 'req-card-body';
+      body.textContent = ev.text || '';
+      card.append(head, body);
+      strip.appendChild(card);
+      if (!replay) toast('已追加第 ' + (ev.cycle || 2) + ' 次需求，他们接着做', 'ok');
+      break;
+    }
+
+    case 'session.confirmed': {
+      // 用户自己宣布任务结束 —— 这是「已完成」唯一的来源
+      if (state.meta) {
+        state.meta.status = 'completed';
+        state.meta.awaitingUser = false;
+        state.meta.confirmedAt = ev.at;
+        renderSessionMeta();
+      }
+      $('btnComplete').hidden = true;
+      if (!replay) toast('你已验收，这个会话标记为已完成', 'ok');
+      break;
+    }
 
     case 'phase': {
       const idx = PHASES.indexOf(ev.phase);
@@ -545,11 +594,13 @@ function applyEvent(ev, replay = false) {
       if (!body) break;
       const wasNear = nearBottom(body);
 
+      // 追加需求后的轮次要标出是第几次需求，否则「第 1 轮」会在同一条时间线上出现两次
+      const cycleTag = ev.cycle > 1 ? '第 ' + ev.cycle + ' 次需求 · ' : '';
       const card = document.createElement('div');
       card.className = 'msg draft';
       card.innerHTML = `
         <div class="msg-head">
-          <span class="msg-round">第 ${ev.round} 轮 · ${PHASE_LABEL[ev.phase] || ev.phase}</span>
+          <span class="msg-round">${cycleTag}第 ${ev.round} 轮 · ${PHASE_LABEL[ev.phase] || ev.phase}</span>
           <span class="msg-time">${fmtTime(ev.ts || Date.now())}</span>
         </div>
         <div class="tools"></div>
@@ -683,8 +734,25 @@ function applyEvent(ev, replay = false) {
 
     case 'checkpoint':
       if (!replay) toast(`已建立 git 检查点 ${String(ev.sha).slice(0, 8)}`, 'ok');
-      if (ev.sha) $('btnRollback').hidden = false;
+      if (ev.sha && !state.running) $('btnRollback').hidden = false;
       break;
+
+    case 'guidance.queued': {
+      // 会话停下时插的话：也放进需求区，否则用户看不到自己说过什么
+      const strip = $('reqStrip');
+      strip.hidden = false;
+      const card = document.createElement('div');
+      card.className = 'req-card note';
+      const head = document.createElement('div');
+      head.className = 'req-card-head';
+      head.textContent = '你说的一句话（已记下）· ' + fmtTime(ev.ts || Date.now());
+      const body = document.createElement('div');
+      body.className = 'req-card-body';
+      body.textContent = ev.text || '';
+      card.append(head, body);
+      strip.appendChild(card);
+      break;
+    }
 
     case 'guidance.delivered':
       // 用户最需要知道的就是"我的话到底送出去没有"，所以这里明确回执
@@ -868,8 +936,12 @@ async function refreshDiff() {
 
 function finishSession(status, outcome, replay = false) {
   state.running = false;
+  $('btnRollback').hidden = !state.meta?.baseSha;
   $('btnStop').disabled = true;
-  $('btnGuidance').disabled = true;
+  // 停下来了也留着插话：那颗按钮变灰等于把用户刚打的话丢掉
+  $('btnGuidance').disabled = !state.sessionId;
+  // 跑完不等于任务结束：按钮一直留着，让用户接着提需求或自己宣布完成
+  updateSessionActions(status);
   if (state.es) { state.es.close(); state.es = null; }
   // 结束就把转圈全部摘掉，别留下"还在跑"的假象
   clearBusyStates();
@@ -901,9 +973,11 @@ function finishSession(status, outcome, replay = false) {
   // 重放历史时不要弹提示：否则每点开一个已结束的会话就弹一个，很快堆成一摞。
   // （其他事件类型早就写了 if (!replay)，这里一直漏着。）
   if (!replay) {
-    const label = (status === 'completed' && outcome === 'done-with-issues')
-      ? '已完成（仍有遗留问题）'
-      : statusText(status);
+    const issues = outcome === 'done-with-issues';
+    const label = status === 'delivered'
+      ? (issues ? '这一轮做完了，但仍有遗留问题 —— 算不算完成由你决定' : '这一轮做完了，等你验收或接着提需求')
+      : (status === 'completed' && issues) ? '已完成（仍有遗留问题）' : statusText(status);
+    // 交付不是「完成」，所以不用成功色的口气；只有用户自己确认过才给 ok
     toast(label, status === 'completed' ? 'ok' : '');
   }
   refreshDiff();
@@ -1060,13 +1134,24 @@ function askConfirm(text, { title = '确认', danger = false } = {}) {
 
 $('btnGuidance').onclick = () => {
   if (!state.sessionId) return;
+  // 文案跟着运行状态走：没在跑的时候要说清这句话什么时候才会生效，
+  // 否则用户会以为按下就立刻有人看。
+  if (state.running) {
+    $('guidanceHint').textContent = '这句话会在下一轮讨论时交给双方，用来纠偏或补充要求。';
+    $('btnGuidanceSend').textContent = '发送';
+  } else {
+    $('guidanceHint').textContent = '这个会话已经没在跑了：这句话会先记下来，等你点「接着提需求」时第一件事就交给双方。';
+    $('btnGuidanceSend').textContent = '记下来';
+  }
   $('guidanceModal').hidden = false;
   $('guidanceText').focus();
 };
 $('btnGuidanceCancel').onclick = () => { $('guidanceModal').hidden = true; };
 // Escape 关掉插话弹窗（确认框有自己的 Escape 处理，见 askConfirm）
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !$('guidanceModal').hidden) $('guidanceModal').hidden = true;
+  if (e.key !== 'Escape') return;
+  if (!$('guidanceModal').hidden) $('guidanceModal').hidden = true;
+  if (!$('continueModal').hidden) $('continueModal').hidden = true;
 });
 $('btnGuidanceSend').onclick = async () => {
   const text = $('guidanceText').value.trim();
@@ -1078,15 +1163,73 @@ $('btnGuidanceSend').onclick = async () => {
       body: JSON.stringify({ text }),
     });
     if (!r.ok) { toast(r.error || '发送失败', 'error'); return; }
-    // 如实说明送达时机：正在跑的那一轮没法中途插进去，下一个发言机会才生效
+    // 如实说明送达时机：正在跑的那一轮没法中途插进去，下一个发言机会才生效；
+    // 没在跑则要说清它只是被记下了，需要用户去点「接着提需求」。
     toast(
-      r.pending > 1
-        ? `已排队 ${r.pending} 条，会在下一个发言机会一起传达`
-        : `已排队，会在下一个发言机会传达（当前：${r.phase || '准备中'}）`,
+      r.queued
+        ? '已记下。这个会话没在跑，等你点「接着提需求」时第一件事就交给他们'
+        : r.pending > 1
+          ? `已排队 ${r.pending} 条，会在下一个发言机会一起传达`
+          : `已排队，会在下一个发言机会传达（当前：${r.phase || '准备中'}）`,
       'ok',
     );
     $('guidanceText').value = '';
     $('guidanceModal').hidden = true;
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+};
+
+/**
+ * 「任务算不算做完」由用户判定。
+ *
+ * 自动化流程跑完只代表这一轮交付了，所以「接着提需求」一直可用；
+ * 「验收通过」只在真的有东西可验收（delivered）时才出现。
+ */
+function updateSessionActions(status = state.meta?.status) {
+  const hasSession = Boolean(state.sessionId);
+  $('btnContinue').disabled = !hasSession || state.running;
+  $('btnComplete').hidden = !hasSession || state.running || status !== 'delivered';
+}
+
+$('btnContinue').onclick = () => {
+  if (!state.sessionId || state.running) return;
+  $('continueModal').hidden = false;
+  $('continueText').focus();
+};
+$('btnContinueCancel').onclick = () => { $('continueModal').hidden = true; };
+$('btnContinueSend').onclick = async () => {
+  const id = state.sessionId;
+  const text = $('continueText').value.trim();
+  if (!id) { toast('先打开一个会话', 'error'); return; }
+  if (!text) return;
+  const btn = $('btnContinueSend');
+  btn.disabled = true;
+  btn.textContent = '提交中…';
+  try {
+    await api(`/api/sessions/${id}/continue`, { method: 'POST', body: JSON.stringify({ text }) });
+    $('continueText').value = '';
+    $('continueModal').hidden = true;
+    toast('已追加需求，他们接着做', 'ok');
+    // 重新打开一次：新一轮的事件、按钮状态、阶段路线都以服务端为准
+    if (state.sessionId === id) await openSession(id);
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '继续讨论';
+  }
+};
+
+$('btnComplete').onclick = async () => {
+  const id = state.sessionId;
+  if (!id) return;
+  if (!(await askConfirm('确认这次任务已经做完？之后还能继续追加需求。', { title: '验收通过' }))) return;
+  if (state.sessionId !== id) return;
+  try {
+    await api(`/api/sessions/${id}/complete`, { method: 'POST' });
+    toast('已标记完成', 'ok');
+    await openSession(id);
   } catch (err) {
     toast(err.message, 'error');
   }
@@ -1176,6 +1319,8 @@ loadSessions();
 // 不显式设一次的话，它们会保持 HTML 里的初始状态 —— 看起来能点，点了没用。
 $('btnStop').disabled = true;
 $('btnGuidance').disabled = true;
+$('btnContinue').disabled = true;
+$('btnComplete').hidden = true;
 
 // 优先恢复到地址栏指向的会话；否则自动回到正在跑的那个
 (async () => {

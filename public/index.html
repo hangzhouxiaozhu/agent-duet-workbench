@@ -150,6 +150,8 @@
         </div>
         <div class="session-controls">
           <button class="btn" id="btnGuidance">插一句话</button>
+          <button class="btn primary" id="btnContinue">接着提需求</button>
+          <button class="btn" id="btnComplete" hidden>验收通过</button>
           <button class="btn danger" id="btnStop">中止</button>
           <button class="btn" id="btnRollback" hidden>回滚到基线</button>
         </div>
@@ -186,6 +188,10 @@
       <!-- 会话级日志：为什么停下来、追加了几轮、有没有报错。
            不显示的话这些信息只存在于事件文件里，界面上完全看不到。 -->
       <div class="session-log" id="sessionLog" hidden></div>
+
+      <!-- 追加的需求（第 2 次起）。标题只放得下第一次的需求，
+           不把后续需求列出来，用户就看不到自己后来又提了什么。 -->
+      <div class="req-strip" id="reqStrip" hidden></div>
 
       <div class="board">
         <div class="column" data-agent="claude">
@@ -235,7 +241,7 @@
 <div class="modal" id="guidanceModal" hidden role="dialog" aria-modal="true" aria-labelledby="guidanceTitle">
   <div class="modal-card">
     <div class="modal-head" id="guidanceTitle">插一句话</div>
-    <p class="sub">这句话会在下一轮讨论时交给双方，用来纠偏或补充要求。</p>
+    <p class="sub" id="guidanceHint">这句话会在下一轮讨论时交给双方，用来纠偏或补充要求。</p>
     <textarea id="guidanceText" rows="4" placeholder="例：别用外部 CDN，全部内联；移动端优先。"></textarea>
     <div class="modal-actions">
       <button class="btn" id="btnGuidanceCancel">取消</button>
@@ -246,6 +252,18 @@
 
 <!-- aria-live：否则所有通知（中止结果、插话回执、验收打回…）对屏幕阅读器完全静默 -->
 <div class="toast-wrap" id="toastWrap" role="status" aria-live="polite"></div>
+
+<div class="modal" id="continueModal" hidden role="dialog" aria-modal="true" aria-labelledby="continueTitle">
+  <div class="modal-card">
+    <div class="modal-head" id="continueTitle">接着提需求</div>
+    <p class="sub">在这个会话里继续加要求：两个 agent 会带着上次交付的方案接着做，之前的记录不会丢。</p>
+    <textarea id="continueText" rows="4" placeholder="例：首页的加载动画去掉；支付失败要能重试一次。"></textarea>
+    <div class="modal-actions">
+      <button class="btn" id="btnContinueCancel">取消</button>
+      <button class="btn primary" id="btnContinueSend">继续讨论</button>
+    </div>
+  </div>
+</div>
 
 <div class="modal" id="confirmModal" hidden role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
   <div class="modal-card">

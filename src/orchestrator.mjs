@@ -85,12 +85,18 @@ function toInt(v, dflt) {
   return Number.isFinite(n) ? Math.trunc(n) : dflt;
 }
 
-export async function runSession({ sessionId, requirement, projectDir, settings, adapters, onEvent }) {
+export async function runSession({
+  sessionId, requirement, projectDir, settings, adapters, onEvent,
+  cycle = 1,        // 这是这个会话的第几次需求（用户每追加一次需求 +1）
+  priorContext = null, // 上一次的需求与已交付方案，追加需求时作为背景
+  resumeIds = null,    // 上次的 CLI 会话 id，让两个 agent 记得之前谈过什么
+}) {
   const meta = store.readMeta(sessionId);
   if (!meta) throw new Error(`会话不存在: ${sessionId}`);
 
   const emit = (event) => {
-    const full = { sessionId, ...event };
+    // cycle 统一注入：前端靠它把「第 2 次需求 · 第 1 轮」和第一次的同名轮次区分开
+    const full = { sessionId, cycle, ...event };
     store.appendEvent(sessionId, full);
     onEvent?.(full);
   };
@@ -98,7 +104,9 @@ export async function runSession({ sessionId, requirement, projectDir, settings,
   const rt = {
     controller: new AbortController(),
     stopped: false,
-    guidance: [],   // 待传达
+    // 待传达。会话停下时用户插的话会留在 meta.pendingGuidance 里，
+    // 所以这一轮一开始就带着它 —— 收下的话不会因为当时没在跑就消失。
+    guidance: [...(meta.pendingGuidance || [])],
     standing: [],   // 已传达，之后每一轮继续作为硬性要求
     phase: null,
   };
@@ -109,7 +117,12 @@ export async function runSession({ sessionId, requirement, projectDir, settings,
 
   const turns = [];       // 讨论记录，用于生成 transcript
   const verdicts = {};    // 最近一轮双方的 verdict
-  const agentSession = {}; // 各自的 CLI session id
+  // 各自的 CLI session id。追加需求时从 meta 带过来，于是两个 agent
+  // 记得之前谈过什么，而不是从零重新认识这个项目。
+  const agentSession = { ...(resumeIds || {}) };
+  // 只有每个 agent 在本次追加需求后的**第一轮**才去续聊；
+  // 之后仍然「每轮都给完整上下文」，保持原来可预测的行为。
+  const pendingResume = new Set(Object.keys(resumeIds || {}));
 
   const maxRounds = clamp(toInt(settings.maxRounds, 4), 1, 8);
   const minRounds = clamp(toInt(settings.minRounds, 2), 1, maxRounds);
@@ -147,6 +160,8 @@ export async function runSession({ sessionId, requirement, projectDir, settings,
     rt.guidance.length = 0;
     // 记成长期要求：用户说了一次「别用外部 CDN」，后面每一轮都该继续遵守
     rt.standing.push(text);
+    // 真的取用了才把落盘的那份清掉：中途崩了也不会把用户的话弄丢
+    store.patchMeta(sessionId, { pendingGuidance: [] });
     emit({ type: 'guidance.delivered', phase, text });
     return text;
   };
@@ -154,8 +169,11 @@ export async function runSession({ sessionId, requirement, projectDir, settings,
   const agentName = (a) => AGENT_META[a]?.name || a;
 
   /** 跑一个 agent 的一轮。始终用完整上下文，行为可预测。 */
-  async function runTurn(agent, { phase, round, prompt, write }) {
+  async function runTurn(agent, { phase, round, prompt, write, noResume = false }) {
     const adapter = adapters[agent];
+    const wantResume = !noResume && pendingResume.has(agent);
+    const resumeId = wantResume ? (agentSession[agent] || null) : null;
+    pendingResume.delete(agent);
     emit({ type: 'turn.start', agent, phase, round });
     const started = Date.now();
 
@@ -163,6 +181,7 @@ export async function runSession({ sessionId, requirement, projectDir, settings,
     const result = await adapter.run({
       prompt,
       cwd: projectDir,
+      resumeId,
       allowWrite: Boolean(write),
       // 讨论阶段一律只读（安全设计，不变）；实现阶段按用户授权的级别给。
       // 'workspace' = 可写项目 + 可联网装依赖；'full' = 完全不限。
@@ -199,6 +218,18 @@ export async function runSession({ sessionId, requirement, projectDir, settings,
 
     if (result.sessionId) agentSession[agent] = result.sessionId;
 
+    /* 续跑时我们让 CLI「接着上次的会话说」。那个 id 存在磁盘上，可能已经被清理
+     * 或过期 —— 那时这一轮会直接失败。用户刚提的新需求不该因为一段可能已不存在的
+     * 历史而丢掉：丢掉 resume 重跑一次，代价只是这一轮没有记忆。 */
+    if (!result.ok && resumeId && !result.aborted && !result.rateLimited && !result.authError) {
+      emit({
+        type: 'log',
+        text: `${agentName(agent)} 的续聊会话不可用（${String(result.error || '未知原因').slice(0, 120)}），改为不带历史重跑这一轮`,
+      });
+      delete agentSession[agent];
+      return runTurn(agent, { phase, round, prompt, write, noResume: true });
+    }
+
     return { ...result, durationMs };
   }
 
@@ -220,8 +251,16 @@ export async function runSession({ sessionId, requirement, projectDir, settings,
 
     store.patchMeta(sessionId, {
       status: 'running',
-      startedAt: new Date().toISOString(),
-      baseSha,
+      phase: 'propose',
+      cycle,
+      // 追加需求意味着「上一轮交付的东西要改」：把用户验收的状态收回，
+      // 免得界面上还挂着「已完成」。
+      awaitingUser: false,
+      confirmedAt: null,
+      // 首次启动才开始计时；追加需求不该把开始时间改成今天
+      ...(meta.startedAt ? {} : { startedAt: new Date().toISOString() }),
+      // 基线保持第一次的那个：整个会话的「回滚到基线」始终指向最初的状态
+      baseSha: meta.baseSha || baseSha,
       settings: { ...settings, maxRounds, minRounds, leadAgent, allowWrite, split, autoRoles },
     });
 
@@ -232,7 +271,7 @@ export async function runSession({ sessionId, requirement, projectDir, settings,
     const proposeGuidance = takeGuidance('propose');
     const proposeResults = await Promise.all(
       ['claude', 'codex'].map(async (agent) => {
-        const prompt = proposePrompt({ agent, requirement, projectDir })
+        const prompt = proposePrompt({ agent, requirement, projectDir, priorContext })
           + guidanceBlock(proposeGuidance);
         const res = await runTurn(agent, { phase: 'propose', round: 1, prompt, write: false });
         return { agent, res };
@@ -513,6 +552,7 @@ export async function runSession({ sessionId, requirement, projectDir, settings,
         agent: finalizer,
         requirement,
         projectDir,
+        priorContext,
         transcriptDigest: digest,
         // 把还没结案的议题交给定稿人 —— 他必须逐条裁决，方案里不许留「待定」
         openIssues: ledger.map((i) => ({ id: i.id, text: i.text, raisedRound: i.raisedRound })),
@@ -673,15 +713,23 @@ export async function runSession({ sessionId, requirement, projectDir, settings,
     const finalDiff = gitguard.diffFrom(projectDir, baseSha);
     emit({ type: 'diff', phase: 'final', diff: finalDiff, files: gitguard.changedFiles(projectDir, baseSha) });
 
-    store.saveTranscript(sessionId, store.renderTranscript({ ...meta, baseSha }, turns));
+    const transcript = store.renderTranscript({ ...meta, baseSha }, turns);
+    if (cycle > 1) store.appendTranscript(sessionId, `\n\n---\n\n${transcript}`);
+    else store.saveTranscript(sessionId, transcript);
     store.patchMeta(sessionId, {
-      status: 'completed',
-      phase: 'completed',
+      // 注意这里是 **delivered（已交付）**，不是 completed。
+      // 「任务算不算做完」由用户判定 —— 自动化流程跑完只代表这一轮做完了；
+      // 用户还可以接着提需求，或者点「验收通过」把它结束掉。
+      status: 'delivered',
+      phase: 'delivered',
+      awaitingUser: true,
       outcome,
+      cycle,
       finishedAt: new Date().toISOString(),
+      deliveredAt: new Date().toISOString(),
       agentSessions: agentSession,
     });
-    emit({ type: 'session.end', status: 'completed', outcome, baseSha });
+    emit({ type: 'session.end', status: 'delivered', outcome, baseSha, awaitingUser: true });
     return { ok: true, outcome };
   } catch (err) {
     const stopped = err instanceof AbortError || rt.stopped;
