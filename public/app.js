@@ -678,8 +678,19 @@ function applyEvent(ev, replay = false) {
       const card = state.drafts[ev.agent];
       if (card && !ev.ok) {
         card.classList.remove('draft');
-        card.classList.add('error');
-        card.querySelector('.msg-body').innerHTML = `<div class="markdown">${renderMarkdown(ev.error || '失败')}</div>`;
+        const bodyEl = card.querySelector('.msg-body');
+        // 被中断时，agent 已经流式产出的内容必须**留着**：立即执行的意思是
+        // 「在这个基础上调整」，不是把它擦掉，更不该用一行错误信息把它盖住。
+        if (ev.aborted && bodyEl.textContent.trim()) {
+          card.classList.add('interrupted');
+          const note = document.createElement('div');
+          note.className = 'interrupt-note';
+          note.textContent = '这一轮被中断，上面的内容已保留，接下来会在它的基础上继续调整';
+          bodyEl.appendChild(note);
+        } else {
+          card.classList.add('error');
+          bodyEl.innerHTML = `<div class="markdown">${renderMarkdown(ev.error || '失败')}</div>`;
+        }
         delete state.drafts[ev.agent];
       }
       if (ev.usage && !replay) {
@@ -1172,7 +1183,7 @@ $('btnGuidanceSend').onclick = async () => {
       r.queued
         ? '已记下。这个会话没在跑，等你点「接着提需求」时第一件事就交给他们'
         : r.interrupted > 0
-          ? `已打断当前这一轮（${r.interrupted} 个发言），马上按新要求重跑`
+          ? `已打断当前这一轮（${r.interrupted} 个发言），他们会在已有的基础上接着调整`
           : r.immediate
             ? '这会儿没有正在跑的轮次，新要求会在下一个发言机会交给他们'
             : r.pending > 1

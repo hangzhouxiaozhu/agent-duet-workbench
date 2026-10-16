@@ -194,6 +194,34 @@ export function continuationBlock(priorContext) {
   return parts.join(String.fromCharCode(10));
 }
 
+/**
+ * 用户点「立即执行」打断这一轮时，给 agent 的「接着改」说明。
+ *
+ * 关键是**不要让它从头重做**：它自己的会话、已经读过的文件、已经产出的半截内容都还在。
+ * 重来一遍既浪费额度，也可能把已经改对的地方再改坏 —— 那正是用户说不能接受的。
+ */
+export function interruptAdjustmentBlock({ guidance, partialText } = {}) {
+  const g = String(guidance || '').trim();
+  const partial = String(partialText || '').trim();
+  if (!g && !partial) return '';
+  const parts = [
+    '',
+    '## ⚠ 用户打断了你，要你现在就调整',
+    '你在这一轮进行到一半时被用户打断。**不要从头重做**，在你已有的基础上调整：',
+    '- 已经做完、且与新要求不冲突的部分，保留，不要重写。',
+    '- 只改与新要求冲突、或还缺的部分。',
+    '- 如果你已经开始改文件，先看磁盘上的当前状态（可能只改了一半），再决定继续。',
+  ];
+  if (g) parts.push('', '### 用户的新要求（优先级最高）', g);
+  if (partial) {
+    const shown = partial.length > 6000
+      ? partial.slice(0, 6000) + String.fromCharCode(10) + '…（以上只是前一部分，已截断）'
+      : partial;
+    parts.push('', '### 你被打断前已经产出的内容（接着往下写，不必重复）', shown);
+  }
+  return parts.join(String.fromCharCode(10));
+}
+
 export function proposePrompt({ agent, requirement, projectDir, round = 1, priorContext = null }) {
   return [
     `你是 ${ROLE[agent]}。`,

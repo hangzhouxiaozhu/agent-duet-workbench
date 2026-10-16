@@ -575,6 +575,13 @@ select {
 .msg-body > *:last-child { margin-bottom: 0; }
 .msg.draft { opacity: 0.75; }
 .msg.error { border-left-color: var(--danger); }
+/* 被中断但已经产出了内容：不用红色告警色，它是「保留的半成品」，不是失败 */
+.msg.interrupted { border-left-color: var(--warn); }
+.msg.interrupted .msg-body { opacity: 0.9; }
+.interrupt-note {
+  margin-top: 8px; padding-top: 6px; border-top: 1px dashed var(--border);
+  font-size: 11.5px; color: var(--text-faint);
+}
 .msg.error .msg-body { color: var(--danger); }
 
 .tools { display: flex; flex-direction: column; gap: var(--sp-1); }

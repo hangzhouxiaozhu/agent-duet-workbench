@@ -8,6 +8,7 @@ import {
   judgeConsensus,
   buildDigest,
   guidanceBlock,
+  interruptAdjustmentBlock,
   AGENT_META,
 } from './prompts.mjs';
 import * as store from './session.mjs';
@@ -240,6 +241,8 @@ export async function runSession({
     const turn = beginTurn({ interruptible: !ignoreInterrupt });
 
     let draft = '';
+    // codex 不发流式片段，只在消息完成时给全文；两条都留着，打断时才不至于两手空空
+    let lastMessage = '';
     let result;
     try {
       result = await adapter.run({
@@ -259,6 +262,9 @@ export async function runSession({
         onEvent: (ev) => {
           if (ev.type === 'delta') {
             draft += ev.text;
+          }
+          if (ev.type === 'message' && ev.text) {
+            lastMessage = ev.text;
           }
           if (ev.type === 'session' && ev.sessionId) {
             agentSession[agent] = ev.sessionId;
@@ -290,6 +296,8 @@ export async function runSession({
       durationMs,
       interruptedByUser: turn.interruptedByUser,
       carriedGuidance: turn.carriedGuidance,
+      // 被打断前已经产出的内容：交给下一轮接着写，而不是丢掉
+      partialText: draft || lastMessage,
     };
   }
 
@@ -303,7 +311,9 @@ export async function runSession({
     let resumeId = wantResume ? (agentSession[agent] || null) : null;
     pendingResume.delete(agent);
 
+    const basePrompt = prompt;
     let attemptPrompt = prompt;
+    const adjustments = [];   // 每次被打断累积一段「接着改」的说明
     let resumeFallbackUsed = false;
     let interruptReruns = 0;
 
@@ -312,7 +322,7 @@ export async function runSession({
        * 打断重跑到 3 次之后，这一轮变成不可打断，让它安安静静跑完。
        * （旧行为是第 3 次打断后直接把这一轮判成失败 —— 在第 1 轮就会把整个会话带崩，
        *   而且报的是「agent 失败」，完全看不出真正原因是用手点出来的。） */
-      const { result, durationMs, interruptedByUser, carriedGuidance } =
+      const { result, durationMs, interruptedByUser, carriedGuidance, partialText } =
         await attemptTurn(agent, {
           phase, round, prompt: attemptPrompt, write, resumeId,
           ignoreInterrupt: interruptReruns >= 3,
@@ -324,10 +334,13 @@ export async function runSession({
        * 目的就是让他不用等 —— 立刻把他的话拼进去，把同一轮重跑一次。 */
       if (result.aborted && interruptedByUser && !rt.stopped) {
         interruptReruns += 1;
-        emit({ type: 'log', text: `已中断 ${agentName(agent)} 当前这一轮，立即按新要求重跑` });
-        if (carriedGuidance) attemptPrompt += guidanceBlock(carriedGuidance);
-        // 被打断的 CLI 会话可能停在半途，别再续聊
-        resumeId = null;
+        emit({ type: 'log', text: `已中断 ${agentName(agent)} 当前这一轮，接着它已有的上下文按新要求调整` });
+        adjustments.push(interruptAdjustmentBlock({ guidance: carriedGuidance, partialText }));
+        const adjustment = adjustments.join(String.fromCharCode(10));
+        /* 保留 resumeId：接着它自己的 CLI 会话说，才叫「在原有上下文基础上调整」。
+         * 续得上就只发调整说明（原任务已经在它的会话里）；续不上才把原任务一起带上，
+         * 保证它仍然知道自己在做什么。 */
+        attemptPrompt = resumeId ? adjustment : basePrompt + adjustment;
         continue;
       }
 
@@ -342,6 +355,8 @@ export async function runSession({
         });
         delete agentSession[agent];
         resumeId = null;
+        // 续不上也要把调整说明带上：不能因为 resume 失效就把用户的要求丢了
+        if (adjustments.length) attemptPrompt = basePrompt + adjustments.join(String.fromCharCode(10));
         continue;
       }
 

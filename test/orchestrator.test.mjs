@@ -812,22 +812,25 @@ test('会话停下时记下的插话，下次继续时第一件事就交给双�
 
 /**
  * 「立即执行」和「排队」必须是两种真实不同的行为：
- * 排队 = 等当前这一轮跑完再交给双方；立即 = 打断当前这一轮，马上按新要求重跑。
+ * 排队 = 等当前这一轮跑完再交给双方；立即 = 打断当前这一轮，在它已有的上下文上接着调整。
  * 并发的两轮（第 1 轮、讨论轮都是两个 agent 同时跑）必须拿到**同一份**要求，
  * 否则会有一个 agent 白跑一轮不带纠正的答案。
  */
-test('立即执行：打断当前这一轮并按新要求重跑，两个 agent 都拿到同一份', async () => {
+test('立即执行：打断后接着原有上下文调整，不丢 CLI 会话与已产出的内容', async () => {
   const project = makeProject('guidance-now');
   const settings = { maxRounds: 2, minRounds: 1, allowWrite: false, maxFixRounds: 0, leadAgent: 'claude', turnTimeoutMs: 5000 };
   const id = store.createSession({ requirement: '改首屏', projectDir: project, settings, status: 'running' }).id;
 
   const prompts = { claude: [], codex: [] };
+  const resumes = { claude: [], codex: [] };
   const make = (agent) => ({
     id: agent, label: agent,
-    async run({ prompt, signal, onEvent }) {
+    async run({ prompt, signal, resumeId, onEvent }) {
       prompts[agent].push(prompt);
+      resumes[agent].push(resumeId);
       if (prompts[agent].length === 1) {
-        // 第一轮挂住，专门等用户点「立即执行」把它打断
+        // 先产出一点内容，再挂住等「立即执行」把它打断
+        onEvent?.({ type: 'delta', text: `我先改了标题（${agent}）` });
         if (signal.aborted) return { ok: false, aborted: true, error: '已中止' };
         await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
         return { ok: false, aborted: true, error: '已中止' };
@@ -843,6 +846,8 @@ test('立即执行：打断当前这一轮并按新要求重跑，两个 agent �
     sessionId: id, requirement: '改首屏', projectDir: project, settings,
     adapters: { claude: make('claude'), codex: make('codex') },
     onEvent: (e) => events.push(e),
+    // 模拟「这个会话之前续聊过」：CLI 会话 id 是有的
+    resumeIds: { claude: 'old-claude', codex: 'old-codex' },
   });
 
   // 等两个 agent 都真的开始跑第一轮（它们是并发跑的）
@@ -856,10 +861,19 @@ test('立即执行：打断当前这一轮并按新要求重跑，两个 agent �
 
   const result = await run;
   assert.equal(result.ok, true, `会话应该跑完: ${result.error}`);
-  assert.ok(prompts.claude.length >= 2 && prompts.codex.length >= 2, '两边都该有一轮重跑');
-  assert.match(prompts.claude[1], /不要再改侧边栏/, '重跑的那一轮必须带上刚插的话');
-  assert.match(prompts.codex[1], /不要再改侧边栏/, '并发的另一方也要拿到同一份要求');
-  assert.ok(events.some((e) => e.type === 'log' && /立即按新要求重跑/.test(e.text || '')), '要如实说明打断了谁');
+
+  for (const agent of ['claude', 'codex']) {
+    assert.ok(prompts[agent].length >= 2, `${agent} 应该被打断后接着改一次`);
+    // 关键：接着同一个 CLI 会话说，这才叫「在原有上下文基础上调整」
+    assert.ok(resumes[agent][1], `${agent} 重跑时必须带着 CLI 会话上下文`);
+    assert.equal(resumes[agent][1], resumes[agent][0], `${agent} 不能把会话上下文丢掉`);
+    assert.match(prompts[agent][1], /不要从头重做/, '要说清是在原有基础上调整，而不是重来');
+    assert.match(prompts[agent][1], /不要再改侧边栏/, '要带上用户的新要求');
+    assert.match(prompts[agent][1], /我先改了标题/, '被打断前已产出的内容要交回去，不能丢');
+    assert.ok(!/## 本轮任务：独立给出方案/.test(prompts[agent][1]), '续得上时只发调整说明，不重复整个原任务');
+  }
+
+  assert.ok(events.some((e) => e.type === 'log' && /接着它已有的上下文按新要求调整/.test(e.text || '')), '要如实说明是接着改');
   assert.ok(events.some((e) => e.type === 'guidance.delivered'), '取用时要有回执');
 });
 test('「立即执行」连点多次也不会把会话跑死', async () => {
