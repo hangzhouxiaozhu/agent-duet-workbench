@@ -862,3 +862,56 @@ test('立即执行：打断当前这一轮并按新要求重跑，两个 agent �
   assert.ok(events.some((e) => e.type === 'log' && /立即按新要求重跑/.test(e.text || '')), '要如实说明打断了谁');
   assert.ok(events.some((e) => e.type === 'guidance.delivered'), '取用时要有回执');
 });
+test('「立即执行」连点多次也不会把会话跑死', async () => {
+  const project = makeProject('guidance-spam');
+  const settings = { maxRounds: 2, minRounds: 1, allowWrite: false, maxFixRounds: 0, leadAgent: 'claude', turnTimeoutMs: 5000 };
+  const id = store.createSession({ requirement: '改首屏', projectDir: project, settings, status: 'running' }).id;
+
+  const prompts = { claude: [], codex: [] };
+  const make = (agent) => ({
+    id: agent, label: agent,
+    async run({ prompt, signal, onEvent }) {
+      prompts[agent].push(prompt);
+      // 前三次都挂住，专门等着被「立即执行」打断；第四次必须能正常跑完
+      if (prompts[agent].length <= 3) {
+        await new Promise((resolve) => {
+          if (signal.aborted) return resolve();
+          signal.addEventListener('abort', resolve, { once: true });
+        });
+        return { ok: false, aborted: true, error: '已中止' };
+      }
+      const text = `改完了。\n\n${VERDICT}`;
+      onEvent?.({ type: 'message', text });
+      return { ok: true, text, sessionId: `s-${agent}` };
+    },
+  });
+
+  const events = [];
+  const run = runSession({
+    sessionId: id, requirement: '改首屏', projectDir: project, settings,
+    adapters: { claude: make('claude'), codex: make('codex') },
+    onEvent: (e) => events.push(e),
+  });
+
+  const waitFor = async (n) => {
+    const deadline = Date.now() + 4000;
+    while ((prompts.claude.length < n || prompts.codex.length < n) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+
+  await waitFor(1);
+  injectGuidance(id, '第一次修正', { immediate: true });
+  await waitFor(2);
+  injectGuidance(id, '第二次修正', { immediate: true });
+  await waitFor(3);
+  injectGuidance(id, '第三次修正', { immediate: true });
+
+  const result = await run;
+  // 关键：不能报成「第 1 轮有 agent 失败」——那会把真正原因（用户连点）藏起来
+  assert.equal(result.ok, true, `连点多次不该把会话判成失败: ${result.error}`);
+  assert.ok(prompts.claude.length >= 4, `第四次尝试必须真的跑起来，实际 ${prompts.claude.length}`);
+  assert.match(prompts.claude[3], /第三次修正/, '最后一次尝试要带上最后那句要求');
+  assert.match(prompts.claude[3], /第一次修正/, '之前几次的要求也要累积保留，不能丢');
+  assert.ok(!events.some((e) => e.type === 'error' && /第 1 轮/.test(e.text || '')), '不该冒出「第 1 轮失败」');
+});

@@ -189,11 +189,12 @@ export async function runSession({
    * 可以只打断当前这一轮，会话继续往下走。 */
   const liveTurns = new Set();
 
-  const beginTurn = () => {
+  const beginTurn = ({ interruptible = true } = {}) => {
     const controller = new AbortController();
     const onSessionAbort = () => controller.abort();
     rt.controller.signal.addEventListener('abort', onSessionAbort, { once: true });
-    liveTurns.add(controller);
+    // 不可打断的轮次不进登记表，于是「立即执行」不会再把它掀掉
+    if (interruptible) liveTurns.add(controller);
     return {
       signal: controller.signal,
       get interruptedByUser() { return Boolean(controller.interruptedByUser); },
@@ -232,11 +233,11 @@ export async function runSession({
    *
    * 调度（要不要重跑）在下面的 runTurn 里，这里只管跑完这一轮并如实回报。
    */
-  async function attemptTurn(agent, { phase, round, prompt, write, resumeId }) {
+  async function attemptTurn(agent, { phase, round, prompt, write, resumeId, ignoreInterrupt = false }) {
     const adapter = adapters[agent];
     emit({ type: 'turn.start', agent, phase, round });
     const started = Date.now();
-    const turn = beginTurn();
+    const turn = beginTurn({ interruptible: !ignoreInterrupt });
 
     let draft = '';
     let result;
@@ -307,14 +308,21 @@ export async function runSession({
     let interruptReruns = 0;
 
     for (;;) {
+      /* 「立即执行」连点很多次也不会把会话跑死：
+       * 打断重跑到 3 次之后，这一轮变成不可打断，让它安安静静跑完。
+       * （旧行为是第 3 次打断后直接把这一轮判成失败 —— 在第 1 轮就会把整个会话带崩，
+       *   而且报的是「agent 失败」，完全看不出真正原因是用手点出来的。） */
       const { result, durationMs, interruptedByUser, carriedGuidance } =
-        await attemptTurn(agent, { phase, round, prompt: attemptPrompt, write, resumeId });
+        await attemptTurn(agent, {
+          phase, round, prompt: attemptPrompt, write, resumeId,
+          ignoreInterrupt: interruptReruns >= 3,
+        });
 
       if (result.sessionId) agentSession[agent] = result.sessionId;
 
       /* 用户点了「立即执行」：这一轮是我们主动打断的（不是会话被停），
        * 目的就是让他不用等 —— 立刻把他的话拼进去，把同一轮重跑一次。 */
-      if (result.aborted && interruptedByUser && !rt.stopped && interruptReruns < 2) {
+      if (result.aborted && interruptedByUser && !rt.stopped) {
         interruptReruns += 1;
         emit({ type: 'log', text: `已中断 ${agentName(agent)} 当前这一轮，立即按新要求重跑` });
         if (carriedGuidance) attemptPrompt += guidanceBlock(carriedGuidance);
