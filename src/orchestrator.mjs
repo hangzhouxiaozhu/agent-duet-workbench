@@ -59,15 +59,31 @@ export function stopSession(sessionId) {
   return { ok: true };
 }
 
-/** 用户在讨论中途插一句话，会在**下一个发言机会**交给双方。 */
-export function injectGuidance(sessionId, text) {
+/**
+ * 用户插一句话。
+ *
+ *   immediate=false（默认）→ 排队，**下一个发言机会**交给双方；
+ *   immediate=true        → 打断当前正在跑的那一轮，马上带上这句话重跑。
+ *
+ * 会话没在跑时不在这里处理（服务端会把话落盘记下，下次继续时交给双方）。
+ */
+export function injectGuidance(sessionId, text, { immediate = false } = {}) {
   const rt = ACTIVE.get(sessionId);
   if (!rt) return { ok: false, error: '会话未在运行' };
   const clean = String(text || '').trim();
   if (!clean) return { ok: false, error: '内容为空' };
   rt.guidance.push(clean);
   // 立刻回执，让界面能显示"已排队"，而不是等下一轮才有动静
-  return { ok: true, pending: rt.guidance.length, phase: rt.phase || null };
+  let interrupted = 0;
+  if (immediate && rt.requestInterrupt) interrupted = rt.requestInterrupt();
+  return {
+    ok: true,
+    pending: rt.guidance.length,
+    phase: rt.phase || null,
+    immediate: Boolean(immediate),
+    // 打断了几轮。0 表示当时没有在跑的轮次，这句会在下一个发言机会生效。
+    interrupted,
+  };
 }
 
 /** 严格布尔：只认真正的布尔和明确的字符串，避免 "false" 这种 truthy 字符串被当成 true。 */
@@ -166,41 +182,93 @@ export async function runSession({
     return text;
   };
 
+  /* 每一轮自己的中断开关。
+   *
+   * 之前所有轮次共用会话级的 AbortController，于是「停掉这一轮」和「停掉整个会话」
+   * 是同一件事 —— 想立即插话就只能把整个会话杀掉。拆开之后，用户点「立即执行」
+   * 可以只打断当前这一轮，会话继续往下走。 */
+  const liveTurns = new Set();
+
+  const beginTurn = () => {
+    const controller = new AbortController();
+    const onSessionAbort = () => controller.abort();
+    rt.controller.signal.addEventListener('abort', onSessionAbort, { once: true });
+    liveTurns.add(controller);
+    return {
+      signal: controller.signal,
+      get interruptedByUser() { return Boolean(controller.interruptedByUser); },
+      get carriedGuidance() { return controller.carriedGuidance || null; },
+      release: () => {
+        liveTurns.delete(controller);
+        rt.controller.signal.removeEventListener('abort', onSessionAbort);
+      },
+    };
+  };
+
+  /**
+   * 「立即执行」：打断当前所有在跑的轮次，并把这句要求当场取走。
+   *
+   * 当场取走（而不是留在缓冲里）是为了让并发的两轮拿到**同一份**要求：
+   * 如果留给它们各自去取，先重跑的那个会把话取走，另一个 agent 就会白跑一轮
+   * 不带纠正的答案。取走时会记进 standing，所以它对后续轮次依然长期有效。
+   */
+  rt.requestInterrupt = () => {
+    const targets = [...liveTurns];
+    // 没有正在跑的轮次：留在缓冲里，下一个发言机会自然会带上它（等价于排队）
+    if (!targets.length) return 0;
+    const text = takeGuidance(rt.phase || 'interrupt');
+    for (const controller of targets) {
+      controller.interruptedByUser = true;
+      if (text) controller.carriedGuidance = text;
+      controller.abort();
+    }
+    return targets.length;
+  };
+
   const agentName = (a) => AGENT_META[a]?.name || a;
 
-  /** 跑一个 agent 的一轮。始终用完整上下文，行为可预测。 */
-  async function runTurn(agent, { phase, round, prompt, write, noResume = false }) {
+  /**
+   * 单次尝试：跑一个 agent 的一轮。始终用完整上下文，行为可预测。
+   *
+   * 调度（要不要重跑）在下面的 runTurn 里，这里只管跑完这一轮并如实回报。
+   */
+  async function attemptTurn(agent, { phase, round, prompt, write, resumeId }) {
     const adapter = adapters[agent];
-    const wantResume = !noResume && pendingResume.has(agent);
-    const resumeId = wantResume ? (agentSession[agent] || null) : null;
-    pendingResume.delete(agent);
     emit({ type: 'turn.start', agent, phase, round });
     const started = Date.now();
+    const turn = beginTurn();
 
     let draft = '';
-    const result = await adapter.run({
-      prompt,
-      cwd: projectDir,
-      resumeId,
-      allowWrite: Boolean(write),
-      // 讨论阶段一律只读（安全设计，不变）；实现阶段按用户授权的级别给。
-      // 'workspace' = 可写项目 + 可联网装依赖；'full' = 完全不限。
-      sandbox: !write
-        ? 'read-only'
-        : (settings.sandbox === 'full' ? 'danger-full-access' : 'workspace-write'),
-      timeoutMs: settings.turnTimeoutMs,
-      signal: rt.controller.signal,
-      onEvent: (ev) => {
-        if (ev.type === 'delta') {
-          draft += ev.text;
-        }
-        if (ev.type === 'session' && ev.sessionId) {
-          agentSession[agent] = ev.sessionId;
-        }
-        // 统一补上 agent/round 维度后转发
-        emit({ ...ev, agent, phase, round });
-      },
-    });
+    let result;
+    try {
+      result = await adapter.run({
+        prompt,
+        cwd: projectDir,
+        resumeId,
+        allowWrite: Boolean(write),
+        // 讨论阶段一律只读（安全设计，不变）；实现阶段按用户授权的级别给。
+        // 'workspace' = 可写项目 + 可联网装依赖；'full' = 完全不限。
+        sandbox: !write
+          ? 'read-only'
+          : (settings.sandbox === 'full' ? 'danger-full-access' : 'workspace-write'),
+        timeoutMs: settings.turnTimeoutMs,
+        // 用这一轮自己的开关，而不是会话级那个：
+        // 否则「打断当前这一轮」就等于「停掉整个会话」
+        signal: turn.signal,
+        onEvent: (ev) => {
+          if (ev.type === 'delta') {
+            draft += ev.text;
+          }
+          if (ev.type === 'session' && ev.sessionId) {
+            agentSession[agent] = ev.sessionId;
+          }
+          // 统一补上 agent/round 维度后转发
+          emit({ ...ev, agent, phase, round });
+        },
+      });
+    } finally {
+      turn.release();
+    }
 
     const durationMs = Date.now() - started;
     emit({
@@ -216,21 +284,61 @@ export async function runSession({
       aborted: result.aborted,
     });
 
-    if (result.sessionId) agentSession[agent] = result.sessionId;
+    return {
+      result,
+      durationMs,
+      interruptedByUser: turn.interruptedByUser,
+      carriedGuidance: turn.carriedGuidance,
+    };
+  }
 
-    /* 续跑时我们让 CLI「接着上次的会话说」。那个 id 存在磁盘上，可能已经被清理
-     * 或过期 —— 那时这一轮会直接失败。用户刚提的新需求不该因为一段可能已不存在的
-     * 历史而丢掉：丢掉 resume 重跑一次，代价只是这一轮没有记忆。 */
-    if (!result.ok && resumeId && !result.aborted && !result.rateLimited && !result.authError) {
-      emit({
-        type: 'log',
-        text: `${agentName(agent)} 的续聊会话不可用（${String(result.error || '未知原因').slice(0, 120)}），改为不带历史重跑这一轮`,
-      });
-      delete agentSession[agent];
-      return runTurn(agent, { phase, round, prompt, write, noResume: true });
+  /**
+   * 跑一个 agent 的一轮，并在两种情况下重跑：
+   *   1. 用户点了「立即执行」→ 这一轮是我们主动打断的，带上新要求重跑；
+   *   2. 续聊的 CLI 会话失效 → 丢掉历史重跑一次。
+   */
+  async function runTurn(agent, { phase, round, prompt, write, noResume = false }) {
+    const wantResume = !noResume && pendingResume.has(agent);
+    let resumeId = wantResume ? (agentSession[agent] || null) : null;
+    pendingResume.delete(agent);
+
+    let attemptPrompt = prompt;
+    let resumeFallbackUsed = false;
+    let interruptReruns = 0;
+
+    for (;;) {
+      const { result, durationMs, interruptedByUser, carriedGuidance } =
+        await attemptTurn(agent, { phase, round, prompt: attemptPrompt, write, resumeId });
+
+      if (result.sessionId) agentSession[agent] = result.sessionId;
+
+      /* 用户点了「立即执行」：这一轮是我们主动打断的（不是会话被停），
+       * 目的就是让他不用等 —— 立刻把他的话拼进去，把同一轮重跑一次。 */
+      if (result.aborted && interruptedByUser && !rt.stopped && interruptReruns < 2) {
+        interruptReruns += 1;
+        emit({ type: 'log', text: `已中断 ${agentName(agent)} 当前这一轮，立即按新要求重跑` });
+        if (carriedGuidance) attemptPrompt += guidanceBlock(carriedGuidance);
+        // 被打断的 CLI 会话可能停在半途，别再续聊
+        resumeId = null;
+        continue;
+      }
+
+      /* 续跑时我们让 CLI「接着上次的会话说」。那个 id 存在磁盘上，可能已经被清理
+       * 或过期 —— 那时这一轮会直接失败。用户刚提的新需求不该因为一段可能已不存在的
+       * 历史而丢掉：丢掉 resume 重跑一次，代价只是这一轮没有记忆。 */
+      if (!result.ok && resumeId && !result.aborted && !result.rateLimited && !result.authError && !resumeFallbackUsed) {
+        resumeFallbackUsed = true;
+        emit({
+          type: 'log',
+          text: `${agentName(agent)} 的续聊会话不可用（${String(result.error || '未知原因').slice(0, 120)}），改为不带历史重跑这一轮`,
+        });
+        delete agentSession[agent];
+        resumeId = null;
+        continue;
+      }
+
+      return { ...result, durationMs };
     }
-
-    return { ...result, durationMs };
   }
 
   function contextBlock(phase, round, agent, peerText) {

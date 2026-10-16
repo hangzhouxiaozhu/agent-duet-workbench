@@ -808,3 +808,57 @@ test('会话停下时记下的插话，下次继续时第一件事就交给双�
   assert.ok(prompts.some((p) => p.includes('上线前先备份数据库')), '第一轮的提示词里必须带上之前记下的插话');
   assert.deepEqual(store.readMeta(id).pendingGuidance, [], '取用之后要清掉，不能反复塞同一句');
 });
+/* ---------------------- 插话的两种生效方式 ---------------------- */
+
+/**
+ * 「立即执行」和「排队」必须是两种真实不同的行为：
+ * 排队 = 等当前这一轮跑完再交给双方；立即 = 打断当前这一轮，马上按新要求重跑。
+ * 并发的两轮（第 1 轮、讨论轮都是两个 agent 同时跑）必须拿到**同一份**要求，
+ * 否则会有一个 agent 白跑一轮不带纠正的答案。
+ */
+test('立即执行：打断当前这一轮并按新要求重跑，两个 agent 都拿到同一份', async () => {
+  const project = makeProject('guidance-now');
+  const settings = { maxRounds: 2, minRounds: 1, allowWrite: false, maxFixRounds: 0, leadAgent: 'claude', turnTimeoutMs: 5000 };
+  const id = store.createSession({ requirement: '改首屏', projectDir: project, settings, status: 'running' }).id;
+
+  const prompts = { claude: [], codex: [] };
+  const make = (agent) => ({
+    id: agent, label: agent,
+    async run({ prompt, signal, onEvent }) {
+      prompts[agent].push(prompt);
+      if (prompts[agent].length === 1) {
+        // 第一轮挂住，专门等用户点「立即执行」把它打断
+        if (signal.aborted) return { ok: false, aborted: true, error: '已中止' };
+        await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+        return { ok: false, aborted: true, error: '已中止' };
+      }
+      const text = `按新要求改了。\n\n${VERDICT}`;
+      onEvent?.({ type: 'message', text });
+      return { ok: true, text, sessionId: `s-${agent}` };
+    },
+  });
+
+  const events = [];
+  const run = runSession({
+    sessionId: id, requirement: '改首屏', projectDir: project, settings,
+    adapters: { claude: make('claude'), codex: make('codex') },
+    onEvent: (e) => events.push(e),
+  });
+
+  // 等两个 agent 都真的开始跑第一轮（它们是并发跑的）
+  await new Promise((resolve) => {
+    const timer = setInterval(() => {
+      if (prompts.claude.length && prompts.codex.length) { clearInterval(timer); resolve(); }
+    }, 10);
+  });
+  const r = injectGuidance(id, '不要再改侧边栏', { immediate: true });
+  assert.equal(r.interrupted, 2, '并发跑的那两轮都该被打断');
+
+  const result = await run;
+  assert.equal(result.ok, true, `会话应该跑完: ${result.error}`);
+  assert.ok(prompts.claude.length >= 2 && prompts.codex.length >= 2, '两边都该有一轮重跑');
+  assert.match(prompts.claude[1], /不要再改侧边栏/, '重跑的那一轮必须带上刚插的话');
+  assert.match(prompts.codex[1], /不要再改侧边栏/, '并发的另一方也要拿到同一份要求');
+  assert.ok(events.some((e) => e.type === 'log' && /立即按新要求重跑/.test(e.text || '')), '要如实说明打断了谁');
+  assert.ok(events.some((e) => e.type === 'guidance.delivered'), '取用时要有回执');
+});

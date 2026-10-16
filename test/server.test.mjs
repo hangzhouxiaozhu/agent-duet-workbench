@@ -548,3 +548,56 @@ test('插话在会话停下时也会被收下（不再返回「未在运行」�
     await new Promise((resolve) => server.close(resolve));
   }
 });
+test('插话可以选「立即执行」：服务端会把 mode 传下去并打断当前轮次', async () => {
+  const project = fs.mkdtempSync(path.join(tmp, 'guidance-now-'));
+  const git = (...args) => execFileSync('git', args, { cwd: project, encoding: 'utf8' }).trim();
+  fs.writeFileSync(path.join(project, 'a.txt'), 'x\n');
+  git('init', '-q');
+  git('add', '-A');
+  git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'base');
+
+  const id = store.createSession({
+    id: 'guidance-now', requirement: '需求', projectDir: project,
+    settings: { maxRounds: 1, minRounds: 1, allowWrite: false, leadAgent: 'claude' },
+    status: 'created',
+  }).id;
+
+  let releaseReady;
+  const ready = new Promise((resolve) => { releaseReady = resolve; });
+  const adapter = {
+    async run({ signal }) {
+      if (signal.aborted) return { ok: false, aborted: true, error: 'aborted' };
+      return new Promise((resolve) => signal.addEventListener(
+        'abort', () => resolve({ ok: false, aborted: true, error: 'aborted' }), { once: true },
+      ));
+    },
+  };
+  const server = createServer({ port: 0 });
+  let run;
+  try {
+    await new Promise((resolve) => server.once('listening', resolve));
+    const base = `http://127.0.0.1:${server.address().port}`;
+    run = runSession({
+      sessionId: id, requirement: '需求', projectDir: project,
+      settings: { maxRounds: 1, minRounds: 1, allowWrite: false, leadAgent: 'claude' },
+      adapters: { claude: adapter, codex: adapter },
+      onEvent: (event) => { if (event.type === 'turn.start') releaseReady(); },
+    });
+    await ready;
+    await new Promise((r2) => setTimeout(r2, 80));   // 让并发的两个 agent 都挂上
+
+    const res = await fetch(`${base}/api/sessions/${id}/guidance`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: '马上改成只读接口', mode: 'now' }),
+    });
+    const body = await res.json();
+    assert.equal(res.status, 200);
+    assert.equal(body.immediate, true);
+    assert.ok(body.interrupted >= 1, `应该打断正在跑的轮次，实际 ${body.interrupted}`);
+    assert.deepEqual(store.readMeta(id).pendingGuidance, [], '这句是当场取用的，不该留成下次继续的待办');
+  } finally {
+    stopSession(id);
+    if (run) await run.catch(() => {});
+    await new Promise((resolve) => server.close(resolve));
+  }
+});

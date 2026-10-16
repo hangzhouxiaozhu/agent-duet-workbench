@@ -243,6 +243,23 @@
     <div class="modal-head" id="guidanceTitle">插一句话</div>
     <p class="sub" id="guidanceHint">这句话会在下一轮讨论时交给双方，用来纠偏或补充要求。</p>
     <textarea id="guidanceText" rows="4" placeholder="例：别用外部 CDN，全部内联；移动端优先。"></textarea>
+    <!-- 两种生效方式：不想打扰就排队，等不及就打断当前这一轮 -->
+    <div class="guidance-modes" id="guidanceModes">
+      <label class="gm">
+        <input type="radio" name="guidanceMode" value="queue" checked />
+        <span class="gm-text">
+          <b>排队到下一轮</b>
+          <span class="gm-note">不打断他们，等这一轮跑完、下一个发言机会再交给双方</span>
+        </span>
+      </label>
+      <label class="gm">
+        <input type="radio" name="guidanceMode" value="now" />
+        <span class="gm-text">
+          <b>立即执行</b>
+          <span class="gm-note">打断当前这一轮，马上按新要求重跑。已经烧掉的额度不退回，正在改的文件可能只改了一半</span>
+        </span>
+      </label>
+    </div>
     <div class="modal-actions">
       <button class="btn" id="btnGuidanceCancel">取消</button>
       <button class="btn primary" id="btnGuidanceSend">发送</button>

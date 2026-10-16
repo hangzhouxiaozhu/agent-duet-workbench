@@ -1137,12 +1137,14 @@ $('btnGuidance').onclick = () => {
   // 文案跟着运行状态走：没在跑的时候要说清这句话什么时候才会生效，
   // 否则用户会以为按下就立刻有人看。
   if (state.running) {
-    $('guidanceHint').textContent = '这句话会在下一轮讨论时交给双方，用来纠偏或补充要求。';
+    $('guidanceHint').textContent = '这句话会交给双方。等不及就选「立即执行」，不想打断当前这一轮就选「排队」。';
     $('btnGuidanceSend').textContent = '发送';
   } else {
     $('guidanceHint').textContent = '这个会话已经没在跑了：这句话会先记下来，等你点「接着提需求」时第一件事就交给双方。';
     $('btnGuidanceSend').textContent = '记下来';
   }
+  // 没在跑就没有"打断当前这一轮"这回事，整个选择器收起来
+  $('guidanceModes').hidden = !state.running;
   $('guidanceModal').hidden = false;
   $('guidanceText').focus();
 };
@@ -1157,10 +1159,11 @@ $('btnGuidanceSend').onclick = async () => {
   const text = $('guidanceText').value.trim();
   if (!text) return;
   if (!state.sessionId) { toast('先开始一次讨论', 'error'); return; }
+  const mode = document.querySelector('input[name="guidanceMode"]:checked')?.value === 'now' ? 'now' : 'queue';
   try {
     const r = await api(`/api/sessions/${state.sessionId}/guidance`, {
       method: 'POST',
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, mode }),
     });
     if (!r.ok) { toast(r.error || '发送失败', 'error'); return; }
     // 如实说明送达时机：正在跑的那一轮没法中途插进去，下一个发言机会才生效；
@@ -1168,9 +1171,13 @@ $('btnGuidanceSend').onclick = async () => {
     toast(
       r.queued
         ? '已记下。这个会话没在跑，等你点「接着提需求」时第一件事就交给他们'
-        : r.pending > 1
-          ? `已排队 ${r.pending} 条，会在下一个发言机会一起传达`
-          : `已排队，会在下一个发言机会传达（当前：${r.phase || '准备中'}）`,
+        : r.interrupted > 0
+          ? `已打断当前这一轮（${r.interrupted} 个发言），马上按新要求重跑`
+          : r.immediate
+            ? '这会儿没有正在跑的轮次，新要求会在下一个发言机会交给他们'
+            : r.pending > 1
+              ? `已排队 ${r.pending} 条，会在下一个发言机会一起传达`
+              : `已排队，会在下一个发言机会传达（当前：${r.phase || '准备中'}）`,
       'ok',
     );
     $('guidanceText').value = '';

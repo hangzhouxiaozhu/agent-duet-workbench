@@ -322,9 +322,15 @@ await sleep(200);
   const hint = JSON.parse(await evaluate(`JSON.stringify({
     text: document.getElementById('guidanceHint').textContent,
     send: document.getElementById('btnGuidanceSend').textContent,
+    modesHidden: document.getElementById('guidanceModes').hidden,
+    modes: [...document.querySelectorAll('input[name="guidanceMode"]')].map((el) => el.value),
+    checked: (document.querySelector('input[name="guidanceMode"]:checked') || {}).value,
   })`));
   check('停下时插话弹窗说明了生效时机', hint.text.includes('接着提需求'), hint.text);
   check('停下时按钮文案是「记下来」而不是「发送」', hint.send === '记下来', hint.send);
+  check('没在跑时不显示「排队 / 立即执行」选择（没有可打断的轮次）', hint.modesHidden === true);
+  check('「排队 / 立即执行」两个选项都在，且默认是排队',
+    hint.modes.join(',') === 'queue,now' && hint.checked === 'queue', JSON.stringify(hint));
   await evaluate(`document.getElementById('btnGuidanceCancel').click()`);
 }
 

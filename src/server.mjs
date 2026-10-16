@@ -476,7 +476,9 @@ export function createServer({ port = DEFAULTS.port } = {}) {
          * 以前这里只会回「会话未在运行」，界面上那颗按钮于是永远是灰的 ——
          * 用户刚打的一段话没有地方去。插话属于「不能被静默丢掉」的那类输入，
          * 所以会话停下也要收下。 */
-        const live = injectGuidance(id, text);
+        const mode = body.mode === 'now' ? 'now' : 'queue';
+        // 只有真的在跑时「立即执行」才有意义；停下时一律走下面落盘那条路
+        const live = injectGuidance(id, text, { immediate: mode === 'now' });
         if (live.ok) return json(res, 200, live);
         const meta = store.readMeta(id);
         if (!meta) return json(res, 404, { error: '会话不存在' });
