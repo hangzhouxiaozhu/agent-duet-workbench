@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import {
   PUBLIC_DIR, DEFAULTS, getBins, claudeAuthStatus, claudeAuthStatusAsync, codexAuthStatus,
   readCodexConfigModel, isSafeModelId, FALLBACK_CLAUDE_MODELS, FALLBACK_CODEX_MODELS,
+  listCodexCatalogAsync, listClaudeModelAliasesAsync,
 } from './config.mjs';
 import { readPrefs, writePrefs, pickModelPrefs } from './prefs.mjs';
 import { createClaudeAdapter } from './adapters/claude.mjs';
@@ -80,23 +81,78 @@ function modelGetter(sessionId, agent) {
  * 界面允许手填任意 id；codex 的默认模型直接读 ~/.codex/config.toml，
  * 读不到就说「默认」，不编一个模型名冒充。
  */
-function modelsPayload(prefs = readPrefs()) {
-  return {
+const MODELS_TTL = 10 * 60 * 1000;
+let modelsCache = { at: 0, data: null };
+
+async function modelsPayload({ fresh = false } = {}) {
+  if (!fresh && modelsCache.data && Date.now() - modelsCache.at < MODELS_TTL) return modelsCache.data;
+
+  const bins = getBins();
+  const prefs = readPrefs();
+  const [catalog, aliases] = await Promise.all([
+    listCodexCatalogAsync(bins.codex),
+    listClaudeModelAliasesAsync(bins.claude),
+  ]);
+
+  // 历史里**真的用过**的模型，比任何「建议值」都可靠
+  const used = { claude: new Set(), codex: new Set() };
+  try {
+    for (const meta of store.listSessions()) {
+      const models = meta.agentModels || {};
+      if (models.claude) used.claude.add(models.claude);
+      if (models.codex) used.codex.add(models.codex);
+      if (meta.settings?.claudeModel) used.claude.add(meta.settings.claudeModel);
+      if (meta.settings?.codexModel) used.codex.add(meta.settings.codexModel);
+    }
+  } catch { /* 历史读不出来不该影响可用列表 */ }
+
+  const merge = (primary, seen) => {
+    const out = [{ id: null, label: '默认' }];
+    const known = new Set();
+    for (const o of primary) {
+      if (o.id == null || known.has(o.id)) continue;
+      known.add(o.id);
+      out.push(o);
+    }
+    for (const id of seen) {
+      if (known.has(id)) continue;
+      known.add(id);
+      out.push({ id, label: `${id}（用过的）` });
+    }
+    return out;
+  };
+
+  const codexDefault = readCodexConfigModel();
+  const payload = {
     claude: {
       key: 'claudeModel',
       configured: prefs.claudeModel ?? DEFAULTS.claudeModel ?? null,
       default: null,
-      options: FALLBACK_CLAUDE_MODELS,
-      note: '留空 = 用 claude 自己的默认模型',
+      source: aliases.length ? 'cli-help' : 'fallback',
+      options: merge(
+        aliases.length
+          ? aliases.map((a) => ({ id: a.id, label: `${a.id}（别名，指向最新）` }))
+          : FALLBACK_CLAUDE_MODELS.filter((o) => o.id != null),
+        used.claude,
+      ),
+      note: '留空 = 用 claude 自己的默认模型。claude 没有列模型的子命令，所以这里是它帮助里写明的别名 + 你用过的模型；其它名字可以手填。',
     },
     codex: {
       key: 'codexModel',
       configured: prefs.codexModel ?? DEFAULTS.codexModel ?? null,
-      default: readCodexConfigModel(),
-      options: FALLBACK_CODEX_MODELS,
-      note: '留空 = 跟随 ~/.codex/config.toml 里的默认模型',
+      default: codexDefault,
+      source: catalog.length ? 'catalog' : 'fallback',
+      options: merge(
+        catalog.length ? catalog : FALLBACK_CODEX_MODELS.filter((o) => o.id != null),
+        used.codex,
+      ),
+      note: codexDefault
+        ? `留空 = 用 ~/.codex/config.toml 里的默认模型（${codexDefault}）`
+        : '留空 = 用 ~/.codex/config.toml 里的默认模型',
     },
   };
+  modelsCache = { at: Date.now(), data: payload };
+  return payload;
 }
 
 async function readBody(req, limit = 8 * 1024 * 1024) {
@@ -264,7 +320,7 @@ export function createServer({ port = DEFAULTS.port } = {}) {
         const payload = {
           bins,
           auth: { claude, codex },
-          models: modelsPayload(),
+          models: await modelsPayload(),
           ready: Boolean(bins.codex && bins.claude && claude.loggedIn && codex.loggedIn),
           defaults: DEFAULTS,
           node: process.version,
@@ -275,7 +331,9 @@ export function createServer({ port = DEFAULTS.port } = {}) {
 
       /* ---------------- 可选模型 ---------------- */
       if (pathname === '/api/models' && req.method === 'GET') {
-        return json(res, 200, { models: modelsPayload() });
+        // 每次都要 spawn 两个 CLI 去问清单，所以带 10 分钟缓存；?fresh=1 强制刷新
+        const fresh = url.searchParams.get('fresh') === '1';
+        return json(res, 200, { models: await modelsPayload({ fresh }) });
       }
 
       /* ---------------- 目录选择 ---------------- */

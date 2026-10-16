@@ -434,11 +434,40 @@ function modelTitle(agent) {
   return lines.join(String.fromCharCode(10));
 }
 
+/**
+ * 列头下拉的选项：真实候选 + 「你选的 / 正在用」兜底项 + 自定义。
+ *
+ * 选中项以 **CLI 实际上报的模型**为准（那是真的在用的那个）；CLI 不上报（codex 就不上报）
+ * 才退回显示你选的。这样这个下拉既回答了「现在用的哪个」，本身又是换模型的入口。
+ */
+function colModelOptionsHtml(agent) {
+  const info = state.modelInfo?.[agent] || {};
+  const list = [...(info.options || [{ id: null, label: '默认' }])];
+  const known = new Set(list.map((o) => o.id));
+  const configured = state.modelConfig[agent] ?? null;
+  const actual = state.agentModels[agent] || null;
+  if (configured && !known.has(configured)) {
+    list.push({ id: configured, label: `${configured}（你选的）` });
+    known.add(configured);
+  }
+  if (actual && !known.has(actual)) {
+    list.push({ id: actual, label: `${actual}（正在用）` });
+    known.add(actual);
+  }
+  const selected = actual && known.has(actual) ? actual : configured;
+  const html = list.map((o) => {
+    const value = o.id == null ? '' : String(o.id);
+    const isSel = (o.id ?? null) === (selected ?? null) ? ' selected' : '';
+    return `<option value="${escapeHtml(value)}"${isSel}>${escapeHtml(o.label || o.id || '默认')}</option>`;
+  }).join('');
+  return html + '<option value="__custom__">自定义…</option>';
+}
+
 function renderModelChips() {
   for (const agent of ['claude', 'codex']) {
     const el = $(agent === 'claude' ? 'modelClaude' : 'modelCodex');
     if (!el) continue;
-    el.textContent = modelLabel(agent);
+    el.innerHTML = colModelOptionsHtml(agent);
     el.title = modelTitle(agent);
     el.classList.toggle('configured', Boolean(state.modelConfig[agent]));
   }
@@ -1286,7 +1315,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   if (!$('guidanceModal').hidden) $('guidanceModal').hidden = true;
   if (!$('continueModal').hidden) $('continueModal').hidden = true;
-  if (!$('modelModal').hidden) $('modelModal').hidden = true;
+  if (!$('modelModal').hidden) { $('modelModal').hidden = true; renderModelChips(); }
 });
 $('btnGuidanceSend').onclick = async () => {
   const text = $('guidanceText').value.trim();
@@ -1476,9 +1505,33 @@ function openModelModal(agent) {
 $('modelSelect').onchange = () => {
   $('modelCustom').hidden = $('modelSelect').value !== '__custom__';
 };
-$('btnModelCancel').onclick = () => { $('modelModal').hidden = true; };
-$('modelClaude').onclick = () => openModelModal('claude');
-$('modelCodex').onclick = () => openModelModal('codex');
+$('btnModelCancel').onclick = () => { $('modelModal').hidden = true; renderModelChips(); };
+$('modelClaude').onchange = () => pickModelFromHeader('claude');
+$('modelCodex').onchange = () => pickModelFromHeader('codex');
+
+/**
+ * 直接在列头下拉里换模型。
+ *
+ * 失败时必须把下拉恢复成真实状态 —— 否则用户看到的是「已经选上了」，实际没生效，
+ * 这种「看起来成功了」的假象比报错更糟糕。
+ */
+async function pickModelFromHeader(agent) {
+  const el = $(agent === 'claude' ? 'modelClaude' : 'modelCodex');
+  if (el.value === '__custom__') { openModelModal(agent); return; }
+  const raw = el.value;
+  try {
+    const r = await api(`/api/sessions/${state.sessionId}/model`, {
+      method: 'POST',
+      body: JSON.stringify({ agent, model: raw }),
+    });
+    state.modelConfig[agent] = r.model ?? null;
+    renderModelChips();
+    toast(r.message || '已更新模型', 'ok');
+  } catch (err) {
+    toast(err.message, 'error');
+    renderModelChips();
+  }
+}
 $('btnModelSave').onclick = async () => {
   if (!state.sessionId || !modelTarget) return;
   const raw = $('modelSelect').value === '__custom__'

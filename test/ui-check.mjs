@@ -927,7 +927,8 @@ check('三态循环回到 auto，且 auto 被解析成了具体的 light/dark',
 console.log('\n模型\n');
 
 {
-  // CLI 没有「列出可用模型」的子命令，所以至少要给出「默认」和手填两条路
+  // 候选要**自动带进来**：codex 读它自己的模型目录，claude 读 CLI 帮助里写明的别名；
+  // 但两边都必须留手填的出口 —— 谁也没法保证列全
   const sel = JSON.parse(await evaluate(`JSON.stringify({
     claude: [...document.getElementById('claudeModel').options].map((o) => o.value),
     codex: [...document.getElementById('codexModel').options].map((o) => o.value),
@@ -937,6 +938,8 @@ console.log('\n模型\n');
     sel.claude.length > 0 && sel.codex.length > 0, JSON.stringify(sel));
   check('第一项是「默认」，选过一次还能回到默认',
     sel.claude[0] === '' && sel.codex[0] === '', JSON.stringify(sel));
+  check('候选是自动带进来的，不是只有一个空列表',
+    sel.claude.length >= 2 && sel.codex.length >= 2, JSON.stringify(sel));
   check('提供「自定义…」档（模型名要能手填，不能只给几个预设）',
     sel.claude.includes('__custom__') && sel.codex.includes('__custom__'), JSON.stringify(sel));
   check('手填框默认是收起的', sel.customHidden === true, JSON.stringify(sel));
@@ -951,51 +954,67 @@ await sleep(2000);
     const codex = document.getElementById('modelCodex');
     const r = el.getBoundingClientRect();
     return JSON.stringify({
-      text: el.textContent,
-      codexText: codex.textContent,
+      isSelect: el.tagName === 'SELECT',
+      label: (el.options[el.selectedIndex] || {}).text || '',
+      codexLabel: (codex.options[codex.selectedIndex] || {}).text || '',
+      options: [...el.options].map((o) => o.value),
       visible: getComputedStyle(el).display !== 'none' && r.width > 0 && r.height > 0,
       hit: document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2) === el,
     });
   })()`));
-  check('每个 agent 的列头都显示模型',
-    chip.text.length > 0 && chip.codexText.length > 0, JSON.stringify(chip));
-  check('模型标签真的显示出来了（不是隐藏或零尺寸）', chip.visible === true, JSON.stringify(chip));
+  check('列头的模型本身就是个可直接切换的下拉', chip.isSelect === true, JSON.stringify(chip));
+  check('两个 agent 的列头都显示当前用的模型',
+    chip.label.length > 0 && chip.codexLabel.length > 0, JSON.stringify(chip));
+  check('下拉里带上了候选模型与「自定义…」',
+    chip.options.length >= 2 && chip.options.includes('__custom__'), JSON.stringify(chip.options));
+  check('模型下拉真的显示出来了（不是隐藏或零尺寸）', chip.visible === true, JSON.stringify(chip));
   // 看得见还得点得着：曾经有按钮被别的元素盖住，DOM 正常但点不到
-  check('模型标签点得到（命中测试）', chip.hit === true, JSON.stringify(chip));
+  check('模型下拉点得到（命中测试）', chip.hit === true, JSON.stringify(chip));
 }
 
 {
-  await evaluate(`document.getElementById('modelClaude').click()`);
-  await sleep(250);
+  // 选「自定义…」应当打开手填弹窗，而不是把 '__custom__' 当成模型名发出去
+  await evaluate(`(() => {
+    const el = document.getElementById('modelClaude');
+    el.value = '__custom__';
+    el.dispatchEvent(new Event('change'));
+  })()`);
+  await sleep(300);
   const m = JSON.parse(await evaluate(`JSON.stringify({
     hidden: document.getElementById('modelModal').hidden,
     display: getComputedStyle(document.getElementById('modelModal')).display,
     title: document.getElementById('modelTitle').textContent,
     options: [...document.getElementById('modelSelect').options].map((o) => o.value),
   })`));
-  check('点模型标签能打开换模型弹窗',
+  check('选「自定义…」会打开手填弹窗',
     m.hidden === false && m.display !== 'none', JSON.stringify(m));
   check('弹窗写清是给谁换模型', m.title.includes('Claude'), m.title);
-  check('弹窗里的选项与建议列表一致',
-    m.options.includes('sonnet') && m.options.includes('__custom__'), JSON.stringify(m.options));
+  check('弹窗里同样有候选和自定义', m.options.includes('__custom__'), JSON.stringify(m.options));
+  await evaluate(`document.getElementById('btnModelCancel').click()`);
+  await sleep(200);
+  const restored = String(await evaluate(`document.getElementById('modelClaude').value`));
+  check('取消后下拉恢复成真实状态（不留在「自定义…」上）',
+    restored !== '__custom__', restored);
 }
 
 {
-  // 通过界面真的换一次，并确认不是只改了界面
+  // 直接在下拉里换一次，并确认不是只改了界面
   await evaluate(`(() => {
-    const sel = document.getElementById('modelSelect');
-    sel.value = 'sonnet';
-    sel.dispatchEvent(new Event('change'));
-    document.getElementById('btnModelSave').click();
+    const el = document.getElementById('modelClaude');
+    el.value = 'sonnet';
+    el.dispatchEvent(new Event('change'));
   })()`);
-  await sleep(800);
+  await sleep(900);
   const after = JSON.parse(await evaluate(`JSON.stringify({
-    chip: document.getElementById('modelClaude').textContent,
-    modalHidden: document.getElementById('modelModal').hidden,
+    value: document.getElementById('modelClaude').value,
+    label: (() => {
+      const el = document.getElementById('modelClaude');
+      return (el.options[el.selectedIndex] || {}).text || '';
+    })(),
     toast: [...document.querySelectorAll('.toast')].map((t) => t.textContent).join(' | '),
   })`));
-  check('保存后列头立刻显示新模型', after.chip.includes('sonnet'), JSON.stringify(after));
-  check('保存后弹窗收起', after.modalHidden === true, JSON.stringify(after));
+  check('下拉换完立刻显示新模型',
+    after.value === 'sonnet' && after.label.includes('sonnet'), JSON.stringify(after));
   check('回执说清了什么时候生效', /生效/.test(after.toast), after.toast);
   check('模型写进了会话本身，而不是只改了个界面',
     store.readMeta(SESSION_ID).settings.claudeModel === 'sonnet',

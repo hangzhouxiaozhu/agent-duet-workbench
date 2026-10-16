@@ -203,8 +203,64 @@ export const FALLBACK_CLAUDE_MODELS = [
   { id: null, label: '默认' },
   { id: 'opus', label: 'opus' },
   { id: 'sonnet', label: 'sonnet' },
+  { id: 'fable', label: 'fable' },
   { id: 'haiku', label: 'haiku' },
 ];
+
+/**
+ * Codex 的**真实**可用模型目录。
+ *
+ * `codex debug models` 会吐一份 JSON 目录（slug / 显示名 / visibility / 优先级）。
+ * 加 `--bundled` 是用随二进制发布的那份：跳过联网刷新，因此不会撞上
+ * `codex_models_manager ... request timed out` 那个超时（实测 48ms）。
+ * 联网刷新那份可能多出账号特有的模型，但代价是可能挂住 —— 手填可以兜住这种情况。
+ */
+export function listCodexCatalogAsync(codexBin) {
+  if (!codexBin) return Promise.resolve([]);
+  return new Promise((resolve) => {
+    execFile(
+      codexBin,
+      ['debug', 'models', '--bundled'],
+      { encoding: 'utf8', timeout: 20000, maxBuffer: 16 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) return resolve([]);
+        try {
+          const parsed = JSON.parse(stdout);
+          // visibility=hide 的是内部用途（自动评审之类），不作为常规选项
+          resolve((parsed.models || [])
+            .filter((m) => m && m.slug && m.visibility !== 'hide')
+            .map((m) => ({ id: m.slug, label: m.display_name || m.slug })));
+        } catch {
+          resolve([]);
+        }
+      },
+    );
+  });
+}
+
+/**
+ * Claude 这边**没有**列模型的子命令（拿别的词去试会被它当成 prompt 真跑一轮），
+ * 所以只能从 `claude --help` 里把 CLI 自己写明的别名抓出来：
+ *   --model <model>   Provide an alias for the latest model (e.g. 'fable', 'opus', or 'sonnet')
+ * 别名指向「最新」那个版本，恰好也是最稳的选择。抓不到就退回静态列表。
+ */
+export function listClaudeModelAliasesAsync(claudeBin) {
+  if (!claudeBin) return Promise.resolve([]);
+  return new Promise((resolve) => {
+    execFile(
+      claudeBin,
+      ['--help'],
+      { encoding: 'utf8', timeout: 15000, maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) return resolve([]);
+        const m = String(stdout).match(/alias for the latest model \(e\.g\.([^)]*)\)/i);
+        if (!m) return resolve([]);
+        const aliases = [...m[1].matchAll(/'([a-z0-9._-]+)'/gi)].map((x) => x[1]);
+        resolve([...new Set(aliases)].map((id) => ({ id, label: id })));
+      },
+    );
+  });
+}
 
 /* ------------------------------------------------------------------ */
 /* 模型                                                                */
