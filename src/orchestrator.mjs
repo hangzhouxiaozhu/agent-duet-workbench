@@ -272,7 +272,13 @@ export async function runSession({
             agentSession[agent] = ev.sessionId;
           }
           if (ev.type === 'session' && ev.model) {
-            agentModel[agent] = String(ev.model);
+            const reported = String(ev.model);
+            if (agentModel[agent] !== reported) {
+              agentModel[agent] = reported;
+              // 立刻落盘，而不是等本轮收尾再写：会话被中止/中断时收尾那段根本不会执行，
+              // 那样这个值就只剩事件流里有（界面靠回放还能显示，但别的地方读 meta 就空了）
+              try { store.patchMeta(sessionId, { agentModels: { ...agentModel } }); } catch { /* meta 写不进去不该拖垮这一轮 */ }
+            }
           }
           // 统一补上 agent/round 维度后转发
           emit({ ...ev, agent, phase, round });

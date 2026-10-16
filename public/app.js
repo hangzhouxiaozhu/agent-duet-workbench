@@ -451,7 +451,8 @@ function colModelOptionsHtml(agent) {
     known.add(configured);
   }
   if (actual && !known.has(actual)) {
-    list.push({ id: actual, label: `${actual}（正在用）` });
+    // 会话没在跑时说「正在用」是假话，那是上一轮跑的那个
+    list.push({ id: actual, label: `${actual}（${state.running ? '正在用' : '上次用的'}）` });
     known.add(actual);
   }
   const selected = actual && known.has(actual) ? actual : configured;

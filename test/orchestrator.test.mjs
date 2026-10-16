@@ -929,3 +929,41 @@ test('「立即执行」连点多次也不会把会话跑死', async () => {
   assert.match(prompts.claude[3], /第一次修正/, '之前几次的要求也要累积保留，不能丢');
   assert.ok(!events.some((e) => e.type === 'error' && /第 1 轮/.test(e.text || '')), '不该冒出「第 1 轮失败」');
 });
+test('CLI 报出模型后立刻落盘：被中断的会话也不会丢这个值', async () => {
+  const project = makeProject('model-immediate');
+  const settings = { maxRounds: 2, minRounds: 2, allowWrite: false, leadAgent: 'claude', turnTimeoutMs: 5000 };
+  const id = store.createSession({
+    requirement: '随便一件事',
+    projectDir: project,
+    settings,
+    status: 'running',
+  }).id;
+
+  let midRun = null;
+  const reporting = (agent, model) => ({
+    id,
+    label: agent,
+    async run({ onEvent }) {
+      onEvent?.({ type: 'session', sessionId: `sess-${agent}`, ...(model ? { model } : {}) });
+      // 事件刚报完就读一次 meta：此刻这一轮还没收尾，收尾那段代码根本还没轮到
+      const now = store.readMeta(id);
+      if (model) midRun = { status: now.status, models: now.agentModels || {} };
+      onEvent?.({ type: 'message', text: VERDICT });
+      return { ok: true, text: VERDICT, sessionId: `sess-${agent}`, usage: {} };
+    },
+  });
+
+  await runSession({
+    sessionId: id,
+    requirement: '随便一件事',
+    projectDir: project,
+    settings,
+    adapters: { claude: reporting('claude', 'claude-opus-5-5'), codex: reporting('codex', null) },
+    onEvent: () => {},
+  });
+
+  assert.ok(midRun, '应当读到 claude 报出的模型');
+  assert.equal(midRun.status, 'running', '读的时候应当还在一轮中途，而不是已经收尾');
+  assert.equal(midRun.models.claude, 'claude-opus-5-5');
+  assert.equal(midRun.models.codex, undefined, 'codex 不上报模型，就不该凭空写一个');
+});
