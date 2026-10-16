@@ -137,6 +137,8 @@ export async function runSession({
   // 各自的 CLI session id。追加需求时从 meta 带过来，于是两个 agent
   // 记得之前谈过什么，而不是从零重新认识这个项目。
   const agentSession = { ...(resumeIds || {}) };
+  // CLI 实际上报的模型（Claude 会给，Codex 不给）
+  const agentModel = {};
   // 只有每个 agent 在本次追加需求后的**第一轮**才去续聊；
   // 之后仍然「每轮都给完整上下文」，保持原来可预测的行为。
   const pendingResume = new Set(Object.keys(resumeIds || {}));
@@ -268,6 +270,9 @@ export async function runSession({
           }
           if (ev.type === 'session' && ev.sessionId) {
             agentSession[agent] = ev.sessionId;
+          }
+          if (ev.type === 'session' && ev.model) {
+            agentModel[agent] = String(ev.model);
           }
           // 统一补上 agent/round 维度后转发
           emit({ ...ev, agent, phase, round });
@@ -859,6 +864,9 @@ export async function runSession({
       finishedAt: new Date().toISOString(),
       deliveredAt: new Date().toISOString(),
       agentSessions: agentSession,
+    // CLI 自己上报的模型（Claude 在 init 事件里给）。Codex 不上报，就留空，
+    // 界面会退回显示「配置值」，而不是假装知道它用了什么。
+    agentModels: agentModel,
     });
     emit({ type: 'session.end', status: 'delivered', outcome, baseSha, awaitingUser: true });
     return { ok: true, outcome };

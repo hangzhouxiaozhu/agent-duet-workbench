@@ -1,6 +1,9 @@
 # Local session history may contain prompts, transcripts, and machine-specific paths
 sessions/
 
+# 界面里记住的偏好（模型选择等），属于本机配置
+prefs.json
+
 # Local dependencies and OS/editor artifacts
 node_modules/
 .DS_Store

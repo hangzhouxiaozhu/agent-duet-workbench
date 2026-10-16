@@ -18,8 +18,10 @@ import { runStreaming, oneLine } from './util.mjs';
 export const CODEX_DEFAULT_BIN =
   '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex';
 
-export function createCodexAdapter({ bin, model }) {
+export function createCodexAdapter({ bin, model, getModel }) {
   if (!bin) throw new Error('未找到 codex 可执行文件');
+  // 每一轮都重新取一次：会话跑着的时候也能换模型，下一个发言就生效
+  const currentModel = () => (typeof getModel === 'function' ? getModel() : model);
 
   return {
     id: 'codex',
@@ -31,9 +33,10 @@ export function createCodexAdapter({ bin, model }) {
         `agent-duet-workbench-codex-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`,
       );
 
+      const modelId = currentModel();
       const args = resumeId
-        ? buildResumeArgs({ resumeId, sandbox, model, outFile })
-        : buildNewArgs({ cwd, sandbox, model, outFile });
+        ? buildResumeArgs({ resumeId, sandbox, model: modelId, outFile })
+        : buildNewArgs({ cwd, sandbox, model: modelId, outFile });
 
       let sessionId = resumeId || null;
       let finalFromStream = '';

@@ -130,6 +130,19 @@
               <input id="maxFixRounds" type="number" min="0" max="4" value="2" />
               <span class="sub">验收打回后最多重做几次</span>
             </label>
+            <!-- 模型：CLI 没有「列出可用模型」的子命令，所以是建议值 + 可手填 -->
+            <label class="field">
+              <span class="label">Claude 用哪个模型</span>
+              <select id="claudeModel"></select>
+              <input id="claudeModelCustom" type="text" placeholder="例：opus / claude-sonnet-4-5" hidden />
+              <span class="sub" id="claudeModelHint">留空 = 用 claude 自己的默认模型</span>
+            </label>
+            <label class="field">
+              <span class="label">Codex 用哪个模型</span>
+              <select id="codexModel"></select>
+              <input id="codexModelCustom" type="text" placeholder="例：gpt-5.1-codex" hidden />
+              <span class="sub" id="codexModelHint">留空 = 跟随 ~/.codex/config.toml</span>
+            </label>
           </div>
         </details>
 
@@ -195,11 +208,19 @@
 
       <div class="board">
         <div class="column" data-agent="claude">
-          <div class="column-head"><span class="dot"></span>Claude <span class="col-status" id="statusClaude"></span></div>
+          <div class="column-head">
+            <span class="dot"></span>Claude
+            <button class="col-model" id="modelClaude" type="button" title="点击选择 Claude 用哪个模型">模型</button>
+            <span class="col-status" id="statusClaude"></span>
+          </div>
           <div class="column-body" id="colClaude"></div>
         </div>
         <div class="column" data-agent="codex">
-          <div class="column-head"><span class="dot"></span>Codex <span class="col-status" id="statusCodex"></span></div>
+          <div class="column-head">
+            <span class="dot"></span>Codex
+            <button class="col-model" id="modelCodex" type="button" title="点击选择 Codex 用哪个模型">模型</button>
+            <span class="col-status" id="statusCodex"></span>
+          </div>
           <div class="column-body" id="colCodex"></div>
         </div>
       </div>
@@ -278,6 +299,21 @@
     <div class="modal-actions">
       <button class="btn" id="btnContinueCancel">取消</button>
       <button class="btn primary" id="btnContinueSend">继续讨论</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="modelModal" hidden role="dialog" aria-modal="true" aria-labelledby="modelTitle">
+  <div class="modal-card">
+    <div class="modal-head" id="modelTitle">选择模型</div>
+    <p class="sub" id="modelHint"></p>
+    <p class="sub" id="modelCurrent"></p>
+    <select id="modelSelect"></select>
+    <input id="modelCustom" type="text" placeholder="直接填模型名" hidden />
+    <p class="sub" id="modelNote"></p>
+    <div class="modal-actions">
+      <button class="btn" id="btnModelCancel">取消</button>
+      <button class="btn primary" id="btnModelSave">保存</button>
     </div>
   </div>
 </div>

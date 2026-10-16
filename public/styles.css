@@ -551,6 +551,15 @@ select {
 .column[data-agent='claude'] .column-head .dot { background: var(--claude); box-shadow: 0 0 0 3px var(--claude-soft); }
 .column[data-agent='codex'] .column-head .dot { background: var(--codex); box-shadow: 0 0 0 3px var(--codex-soft); }
 .col-status { margin-left: auto; font-size: 11.5px; font-weight: 500; color: var(--text-faint); }
+/* 列头的模型标签：看着是标签，其实点得动（点开换模型） */
+.col-model {
+  max-width: 16ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: 1px 8px; border-radius: var(--r-pill);
+  border: 1px solid var(--border); background: var(--bg-inset);
+  color: var(--text-faint); font-size: 11px; font-weight: 500; cursor: pointer;
+}
+.col-model:hover { border-color: var(--brand); color: var(--brand); }
+.col-model.configured { color: var(--text-dim); border-color: var(--border-strong); }
 .col-status.busy { color: var(--brand); }
 .column-body {
   padding: var(--sp-4); overflow-y: auto; max-height: 46vh; min-height: 160px;
@@ -703,6 +712,10 @@ pre.diff .meta { color: var(--text-faint); display: block; }
 .modal-head { font-size: 16px; font-weight: 700; margin-bottom: 6px; letter-spacing: -0.01em; }
 .modal-card .sub { margin: 0 0 var(--sp-4); font-size: 12.5px; color: var(--text-dim); }
 .modal-actions { display: flex; justify-content: flex-end; gap: var(--sp-2); margin-top: var(--sp-4); }
+/* 模型弹窗里的下拉与手填框，上下用同一条间距，别贴在一起 */
+#modelModal select, #modelModal input[type='text'] { width: 100%; margin-bottom: var(--sp-3); }
+#modelModal .sub { margin-bottom: var(--sp-3); }
+#modelModal #modelSelect { margin-bottom: var(--sp-2); }
 
 /* ------------------------------------------------------------ 提示条 */
 .toast-wrap {

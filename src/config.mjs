@@ -206,6 +206,47 @@ export const FALLBACK_CLAUDE_MODELS = [
   { id: 'haiku', label: 'haiku' },
 ];
 
+/* ------------------------------------------------------------------ */
+/* 模型                                                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 读 ~/.codex/config.toml 里顶层写的 `model = "..."`。
+ *
+ * codex 不带 -m 时用的就是这个值，而它没法从 CLI 问出来（没有 `codex models` 这种子命令，
+ * 它的模型目录刷新还会超时）。读配置文件是唯一诚实的来源；
+ * 读不到就返回 null，界面显示「默认」，不编一个模型名糊弄用户。
+ */
+export function readCodexConfigModel() {
+  const file = path.join(HOME, '.codex', 'config.toml');
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch {
+    return null;
+  }
+  for (const raw of text.split(String.fromCharCode(10))) {
+    const line = raw.trim();
+    if (line.startsWith('[')) break;   // 到 [profile.x] 段就说明顶层已经结束了
+    if (line.startsWith('#')) continue;
+    const m = line.match(/^model\s*=\s*["']([^"']+)["']/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/**
+ * 模型 id 是否合法。
+ *
+ * **必须挡住以 `-` 开头的东西**：这个值会被原样塞到 `--model` / `-m` 后面，
+ * 若允许 `--dangerously-...` 这类字符串，就等于借「改模型」这个口子
+ * 给 CLI 注入任意参数。
+ */
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:@\/+\-]{0,79}$/;
+export function isSafeModelId(value) {
+  return typeof value === 'string' && MODEL_ID.test(value);
+}
+
 export function ensureSessionsDir() {
   fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 }

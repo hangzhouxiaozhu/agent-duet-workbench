@@ -16,11 +16,14 @@ import { spawn, execFileSync } from 'node:child_process';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-duet-workbench-srv-'));
 process.env.AGENT_DUET_WORKBENCH_SESSIONS_DIR = path.join(tmp, 'sessions');
+// 偏好文件也要隔离：否则测试会给仓库根目录写一个真的 prefs.json
+process.env.AGENT_DUET_WORKBENCH_PREFS_FILE = path.join(tmp, 'prefs.json');
 
 // 必须先设好环境变量再动态导入：config.mjs 在导入时就读取它
 const store = await import('../src/session.mjs');
 const { reconcileOrphanSessions, createServer } = await import('../src/server.mjs');
 const { runSession, stopSession } = await import('../src/orchestrator.mjs');
+const prefs = await import('../src/prefs.mjs');
 
 const make = (status, id) => store.createSession({
   id,
@@ -598,6 +601,100 @@ test('插话可以选「立即执行」：服务端会把 mode 传下去并打�
   } finally {
     stopSession(id);
     if (run) await run.catch(() => {});
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+test('GET /api/models：给出建议列表，并如实标明「默认」的含义', async () => {
+  const server = createServer({ port: 0 });
+  try {
+    await new Promise((resolve) => server.once('listening', resolve));
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const res = await fetch(`${base}/api/models`);
+    assert.equal(res.status, 200);
+    const { models } = await res.json();
+    for (const agent of ['claude', 'codex']) {
+      assert.ok(Array.isArray(models[agent].options), `${agent} 要有可选列表`);
+      assert.ok(models[agent].options.length > 1, `${agent} 的建议列表不能只有一项`);
+      // 第一项必须是「默认」，否则用户选过一次就回不到默认了
+      assert.equal(models[agent].options[0].id, null, `${agent} 的第一项应该是默认`);
+      assert.equal(models[agent].configured, prefs.readPrefs()[models[agent].key] ?? null, '配置值要和偏好一致');
+    }
+    assert.equal(models.claude.default, null, 'claude 没有可读的配置文件，就如实说不知道');
+    assert.ok('default' in models.codex, 'codex 的默认模型：要么给出配置值，要么是 null');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('换模型：写进会话设置与偏好，并在时间线里留痕', async () => {
+  const id = store.createSession({
+    id: 'model-change', requirement: '需求', projectDir: tmp,
+    settings: { claudeModel: null, codexModel: null }, status: 'completed',
+  }).id;
+  const server = createServer({ port: 0 });
+  try {
+    await new Promise((resolve) => server.once('listening', resolve));
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const post = (p, body) => fetch(`${base}${p}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+
+    const r = await post(`/api/sessions/${id}/model`, { agent: 'claude', model: 'sonnet' });
+    const body = await r.json();
+    assert.equal(r.status, 200);
+    assert.equal(body.model, 'sonnet');
+    // 没在跑，所以是「下次继续」才生效 —— 回执必须说对时机
+    assert.equal(body.effective, 'next-run');
+    assert.match(body.message, /sonnet/);
+    assert.equal(store.readMeta(id).settings.claudeModel, 'sonnet');
+    assert.equal(prefs.readPrefs().claudeModel, 'sonnet', '要记住这次选择，下次新建会话好预填');
+
+    const ev = store.readEvents(id).find((e) => e.type === 'model.changed');
+    assert.ok(ev, '换模型这件事要留在时间线里，否则「换了怎么没变」无从查起');
+    assert.equal(ev.agent, 'claude');
+    assert.equal(ev.model, 'sonnet');
+
+    // 两个 agent 互不影响
+    await post(`/api/sessions/${id}/model`, { agent: 'codex', model: 'o3' });
+    const settings = store.readMeta(id).settings;
+    assert.equal(settings.claudeModel, 'sonnet');
+    assert.equal(settings.codexModel, 'o3');
+
+    // 清空 = 回到默认
+    const back = await post(`/api/sessions/${id}/model`, { agent: 'claude', model: '  ' });
+    assert.equal((await back.json()).model, null);
+    assert.equal(store.readMeta(id).settings.claudeModel, null);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('换模型：挡住参数注入、非法 agent 与不存在的会话', async () => {
+  const id = store.createSession({
+    id: 'model-guard', requirement: '需求', projectDir: tmp,
+    settings: { claudeModel: 'sonnet' }, status: 'completed',
+  }).id;
+  const server = createServer({ port: 0 });
+  try {
+    await new Promise((resolve) => server.once('listening', resolve));
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const post = (p, body) => fetch(`${base}${p}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+
+    // 这个值会被拼到 --model 后面：允许它 - 开头就等于给 CLI 注入参数
+    const inject = await post(`/api/sessions/${id}/model`, {
+      agent: 'claude', model: '--dangerously-skip-permissions',
+    });
+    assert.equal(inject.status, 400);
+    assert.match((await inject.json()).error, /不合法/);
+    assert.equal(store.readMeta(id).settings.claudeModel, 'sonnet', '被拒的写入不能落盘');
+
+    assert.equal((await post(`/api/sessions/${id}/model`, { agent: 'gemini', model: 'x' })).status, 400);
+    assert.equal((await post('/api/sessions/nope/model', { agent: 'claude', model: 'x' })).status, 404);
+  } finally {
     await new Promise((resolve) => server.close(resolve));
   }
 });

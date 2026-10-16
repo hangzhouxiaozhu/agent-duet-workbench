@@ -2,7 +2,11 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
-import { PUBLIC_DIR, DEFAULTS, getBins, claudeAuthStatus, claudeAuthStatusAsync, codexAuthStatus } from './config.mjs';
+import {
+  PUBLIC_DIR, DEFAULTS, getBins, claudeAuthStatus, claudeAuthStatusAsync, codexAuthStatus,
+  readCodexConfigModel, isSafeModelId, FALLBACK_CLAUDE_MODELS, FALLBACK_CODEX_MODELS,
+} from './config.mjs';
+import { readPrefs, writePrefs, pickModelPrefs } from './prefs.mjs';
 import { createClaudeAdapter } from './adapters/claude.mjs';
 import { createCodexAdapter } from './adapters/codex.mjs';
 import * as store from './session.mjs';
@@ -46,6 +50,53 @@ function json(res, code, body) {
     'Cache-Control': 'no-store',
   });
   res.end(text);
+}
+
+/**
+ * 取某个会话某个 agent 当前该用的模型。
+ *
+ * 每次 spawn 前现读 meta：会话跑着的时候也能改，改完下一个发言就生效。
+ * 不在建会话时把模型烧进适配器，是因为模型选错（没开通、额度不够、权限不匹配）时
+ * 唯一合理的补救就是换一个，而不是要求用户把整场讨论杀掉重开。
+ */
+function modelGetter(sessionId, agent) {
+  const key = agent === 'claude' ? 'claudeModel' : 'codexModel';
+  return () => {
+    try {
+      const settings = (store.readMeta(sessionId) || {}).settings || {};
+      const value = settings[key];
+      return value == null || value === '' ? null : String(value);
+    } catch {
+      return null;
+    }
+  };
+}
+
+/**
+ * 可选模型列表。
+ *
+ * 诚实说明：claude / codex 都没有「列出可用模型」的子命令 —— codex 的模型目录
+ * 刷新还会超时（就是日志里那条 codex_models_manager）。所以这里给的是**建议值**，
+ * 界面允许手填任意 id；codex 的默认模型直接读 ~/.codex/config.toml，
+ * 读不到就说「默认」，不编一个模型名冒充。
+ */
+function modelsPayload(prefs = readPrefs()) {
+  return {
+    claude: {
+      key: 'claudeModel',
+      configured: prefs.claudeModel ?? DEFAULTS.claudeModel ?? null,
+      default: null,
+      options: FALLBACK_CLAUDE_MODELS,
+      note: '留空 = 用 claude 自己的默认模型',
+    },
+    codex: {
+      key: 'codexModel',
+      configured: prefs.codexModel ?? DEFAULTS.codexModel ?? null,
+      default: readCodexConfigModel(),
+      options: FALLBACK_CODEX_MODELS,
+      note: '留空 = 跟随 ~/.codex/config.toml 里的默认模型',
+    },
+  };
 }
 
 async function readBody(req, limit = 8 * 1024 * 1024) {
@@ -207,18 +258,24 @@ export function createServer({ port = DEFAULTS.port } = {}) {
         // 其它会话全部停摆（实测并发请求被卡 4.6 秒，最坏 20 秒）。
         const claude = await claudeAuthStatusAsync(bins.claude);
         const codex = codexAuthStatus(bins.codex);
+        // 这里原先写死了两个模型名（claude-opus-5-5 / gpt-6.1-sol），是占位值、
+        // 跟实际使用毫无关系，界面却照着显示 —— 属于「看起来有信息」的假信息。
+        // 现在只报能真正查证的：用户选的模型，和 codex 配置文件里的默认模型。
         const payload = {
           bins,
-          auth: {
-            claude: { ...claude, model: 'claude-opus-5-5' },
-            codex: { ...codex, model: 'gpt-6.1-sol' },
-          },
+          auth: { claude, codex },
+          models: modelsPayload(),
           ready: Boolean(bins.codex && bins.claude && claude.loggedIn && codex.loggedIn),
           defaults: DEFAULTS,
           node: process.version,
         };
         healthCache = { at: now, data: payload };
         return json(res, 200, payload);
+      }
+
+      /* ---------------- 可选模型 ---------------- */
+      if (pathname === '/api/models' && req.method === 'GET') {
+        return json(res, 200, { models: modelsPayload() });
       }
 
       /* ---------------- 目录选择 ---------------- */
@@ -257,6 +314,8 @@ export function createServer({ port = DEFAULTS.port } = {}) {
         }
 
         const settings = { ...DEFAULTS, ...(body.settings || {}) };
+        // 记住这次选的模型，下次打开表单直接预填；只写用户真的选了的键
+        writePrefs(pickModelPrefs(body.settings || {}));
         const meta = store.createSession({
           requirement,
           projectDir,
@@ -268,8 +327,8 @@ export function createServer({ port = DEFAULTS.port } = {}) {
         });
 
         const adapters = {
-          claude: createClaudeAdapter({ bin: bins.claude, model: settings.claudeModel }),
-          codex: createCodexAdapter({ bin: bins.codex, model: settings.codexModel }),
+          claude: createClaudeAdapter({ bin: bins.claude, getModel: modelGetter(meta.id, 'claude') }),
+          codex: createCodexAdapter({ bin: bins.codex, getModel: modelGetter(meta.id, 'codex') }),
         };
 
         // 立刻返回会话 id，编排在后台跑，事件走 SSE
@@ -422,8 +481,8 @@ export function createServer({ port = DEFAULTS.port } = {}) {
 
         const settings = { ...DEFAULTS, ...(meta.settings || {}) };
         const adapters = {
-          claude: createClaudeAdapter({ bin: bins.claude, model: settings.claudeModel }),
-          codex: createCodexAdapter({ bin: bins.codex, model: settings.codexModel }),
+          claude: createClaudeAdapter({ bin: bins.claude, getModel: modelGetter(id, 'claude') }),
+          codex: createCodexAdapter({ bin: bins.codex, getModel: modelGetter(id, 'codex') }),
         };
         // 先回执再开跑：界面立刻能切到这个会话并连上 SSE
         json(res, 200, { ok: true, id, cycle });
@@ -489,6 +548,51 @@ export function createServer({ port = DEFAULTS.port } = {}) {
         });
         broadcast(record);
         return json(res, 200, { ok: true, queued: true, pending: pending.length });
+      }
+
+      /* ---------------- 换模型 ---------------- */
+      const modelRoute = pathname.match(/^\/api\/sessions\/([^/]+)\/model$/);
+      if (modelRoute && req.method === 'POST') {
+        const id = decodeURIComponent(modelRoute[1]);
+        const meta = store.readMeta(id);
+        if (!meta) return json(res, 404, { error: '会话不存在' });
+        const body = await readBody(req);
+        const agent = String(body.agent || '');
+        if (agent !== 'claude' && agent !== 'codex') {
+          return json(res, 400, { error: 'agent 只能是 claude 或 codex' });
+        }
+        const raw = body.model == null || String(body.model).trim() === ''
+          ? null
+          : String(body.model).trim();
+        // 这个值会被塞进 `--model` / `-m` 后面，必须挡住以 - 开头的东西，否则等于注入 CLI 参数
+        if (raw !== null && !isSafeModelId(raw)) {
+          return json(res, 400, {
+            error: '模型名不合法：只能用字母数字与 . _ : @ / + -，且不能以 - 开头',
+          });
+        }
+        const key = agent === 'claude' ? 'claudeModel' : 'codexModel';
+        store.patchMeta(id, { settings: { ...(meta.settings || {}), [key]: raw } });
+        writePrefs({ [key]: raw });
+        // 跑着的时候改，从下一个发言起生效（适配器每轮现取模型）；
+        // 停下的时候改，下次继续时才生效。两种都如实写进时间线，
+        // 否则「我明明换了模型怎么还是老样子」这种问题无从查起。
+        const live = Boolean(getRuntime(id));
+        const record = store.appendEvent(id, {
+          sessionId: id,
+          type: 'model.changed',
+          agent,
+          model: raw,
+          effective: live ? 'next-turn' : 'next-run',
+        });
+        broadcast(record);
+        const when = live ? '从下一个发言起生效' : '下次继续时生效';
+        return json(res, 200, {
+          ok: true,
+          agent,
+          model: raw,
+          effective: record.effective,
+          message: raw ? `${agent} 换成 ${raw}，${when}` : `${agent} 恢复默认模型，${when}`,
+        });
       }
 
       /* ---------------- 回滚 ---------------- */

@@ -35,8 +35,10 @@ export function looksLikeLimitNotice(text) {
   return t.length > 0 && t.length < 400 && LIMIT_HINT.test(t);
 }
 
-export function createClaudeAdapter({ bin, model }) {
+export function createClaudeAdapter({ bin, model, getModel }) {
   if (!bin) throw new Error('未找到 claude 可执行文件');
+  // 每一轮都重新取一次：会话跑着的时候也能换模型，下一个发言就生效
+  const currentModel = () => (typeof getModel === 'function' ? getModel() : model);
 
   return {
     id: 'claude',
@@ -58,7 +60,8 @@ export function createClaudeAdapter({ bin, model }) {
         args.push('--disallowedTools', ...WRITE_TOOLS);
       }
 
-      if (model) args.push('--model', model);
+      const modelId = currentModel();
+      if (modelId) args.push('--model', modelId);
       if (resumeId) args.push('--resume', resumeId);
 
       let sessionId = resumeId || null;

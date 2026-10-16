@@ -37,6 +37,8 @@ function check(name, ok, detail) {
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-duet-workbench-ui-'));
 process.env.AGENT_DUET_WORKBENCH_SESSIONS_DIR = path.join(tmp, 'sessions');
+// 偏好文件同样要隔离：界面里改模型会写它，不隔离就会写到仓库根目录的 prefs.json
+process.env.AGENT_DUET_WORKBENCH_PREFS_FILE = path.join(tmp, 'prefs.json');
 
 // 造一个**真实的 git 项目**：这样 /changes 接口走的是真实路径，
 // 而不是被测试桩糊弄过去（之前就是因为用了假目录，才暴露出 refreshDiff 会清空内容）。
@@ -919,6 +921,88 @@ const auto = await themeSnapshot();
 check('三态循环回到 auto，且 auto 被解析成了具体的 light/dark',
   auto.pref === 'auto' && (auto.theme === 'light' || auto.theme === 'dark'),
   JSON.stringify(auto));
+
+/* ---------- 13. 模型管理 ---------- */
+
+console.log('\n模型\n');
+
+{
+  // CLI 没有「列出可用模型」的子命令，所以至少要给出「默认」和手填两条路
+  const sel = JSON.parse(await evaluate(`JSON.stringify({
+    claude: [...document.getElementById('claudeModel').options].map((o) => o.value),
+    codex: [...document.getElementById('codexModel').options].map((o) => o.value),
+    customHidden: document.getElementById('claudeModelCustom').hidden,
+  })`));
+  check('高级设置里有 Claude / Codex 的模型选择器',
+    sel.claude.length > 0 && sel.codex.length > 0, JSON.stringify(sel));
+  check('第一项是「默认」，选过一次还能回到默认',
+    sel.claude[0] === '' && sel.codex[0] === '', JSON.stringify(sel));
+  check('提供「自定义…」档（模型名要能手填，不能只给几个预设）',
+    sel.claude.includes('__custom__') && sel.codex.includes('__custom__'), JSON.stringify(sel));
+  check('手填框默认是收起的', sel.customHidden === true, JSON.stringify(sel));
+}
+
+// 跑起来之后至少要能看见「用的是哪个模型」，而且点得动
+await evaluate(`location.hash = '#/s/${SESSION_ID}'`);
+await sleep(2000);
+{
+  const chip = JSON.parse(await evaluate(`(() => {
+    const el = document.getElementById('modelClaude');
+    const codex = document.getElementById('modelCodex');
+    const r = el.getBoundingClientRect();
+    return JSON.stringify({
+      text: el.textContent,
+      codexText: codex.textContent,
+      visible: getComputedStyle(el).display !== 'none' && r.width > 0 && r.height > 0,
+      hit: document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2) === el,
+    });
+  })()`));
+  check('每个 agent 的列头都显示模型',
+    chip.text.length > 0 && chip.codexText.length > 0, JSON.stringify(chip));
+  check('模型标签真的显示出来了（不是隐藏或零尺寸）', chip.visible === true, JSON.stringify(chip));
+  // 看得见还得点得着：曾经有按钮被别的元素盖住，DOM 正常但点不到
+  check('模型标签点得到（命中测试）', chip.hit === true, JSON.stringify(chip));
+}
+
+{
+  await evaluate(`document.getElementById('modelClaude').click()`);
+  await sleep(250);
+  const m = JSON.parse(await evaluate(`JSON.stringify({
+    hidden: document.getElementById('modelModal').hidden,
+    display: getComputedStyle(document.getElementById('modelModal')).display,
+    title: document.getElementById('modelTitle').textContent,
+    options: [...document.getElementById('modelSelect').options].map((o) => o.value),
+  })`));
+  check('点模型标签能打开换模型弹窗',
+    m.hidden === false && m.display !== 'none', JSON.stringify(m));
+  check('弹窗写清是给谁换模型', m.title.includes('Claude'), m.title);
+  check('弹窗里的选项与建议列表一致',
+    m.options.includes('sonnet') && m.options.includes('__custom__'), JSON.stringify(m.options));
+}
+
+{
+  // 通过界面真的换一次，并确认不是只改了界面
+  await evaluate(`(() => {
+    const sel = document.getElementById('modelSelect');
+    sel.value = 'sonnet';
+    sel.dispatchEvent(new Event('change'));
+    document.getElementById('btnModelSave').click();
+  })()`);
+  await sleep(800);
+  const after = JSON.parse(await evaluate(`JSON.stringify({
+    chip: document.getElementById('modelClaude').textContent,
+    modalHidden: document.getElementById('modelModal').hidden,
+    toast: [...document.querySelectorAll('.toast')].map((t) => t.textContent).join(' | '),
+  })`));
+  check('保存后列头立刻显示新模型', after.chip.includes('sonnet'), JSON.stringify(after));
+  check('保存后弹窗收起', after.modalHidden === true, JSON.stringify(after));
+  check('回执说清了什么时候生效', /生效/.test(after.toast), after.toast);
+  check('模型写进了会话本身，而不是只改了个界面',
+    store.readMeta(SESSION_ID).settings.claudeModel === 'sonnet',
+    JSON.stringify(store.readMeta(SESSION_ID).settings));
+  check('换模型在时间线里留痕（否则「换了怎么没变」无从查起）',
+    store.readEvents(SESSION_ID).some((e) => e.type === 'model.changed' && e.model === 'sonnet'));
+}
 
 /* ---------- 7. 汇总 ---------- */
 

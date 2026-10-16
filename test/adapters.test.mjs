@@ -1,8 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { runStreaming, killAllChildren, liveChildCount, describeToolInput, oneLine } from '../src/adapters/util.mjs';
-import { isBenignCodexError, isModelRefreshTimeout, buildNewArgs, buildResumeArgs } from '../src/adapters/codex.mjs';
+import {
+  isBenignCodexError, isModelRefreshTimeout, buildNewArgs, buildResumeArgs, createCodexAdapter,
+} from '../src/adapters/codex.mjs';
 import { looksLikeLimitNotice } from '../src/adapters/claude.mjs';
 
 /**
@@ -192,4 +197,51 @@ test('正常回答不会被误判成额度提示', () => {
   for (const t of misses) {
     assert.equal(looksLikeLimitNotice(t), false, `不该误判：${JSON.stringify(t.slice(0, 40))}`);
   }
+});
+test('模型每轮现取：中途换了模型，下一个发言就用新的', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-duet-adapters-'));
+  const log = path.join(dir, 'args.txt');
+  const bin = path.join(dir, 'fake-codex.sh');
+  // 假 CLI：把收到的参数记下来，再吐一个最小可用的 codex JSONL 流
+  fs.writeFileSync(bin, [
+    '#!/bin/sh',
+    `echo "$@" >> "${log}"`,
+    `printf '{"type":"thread.started","thread_id":"th_1"}\\n'`,
+    `echo '{"type":"item.completed","item":{"type":"agent_message","text":"改完了"}}'`,
+  ].join(String.fromCharCode(10)));
+  fs.chmodSync(bin, 0o755);
+
+  let model = 'gpt-5.1-codex';
+  const adapter = createCodexAdapter({ bin, getModel: () => model });
+  const first = await adapter.run({ prompt: 'x', cwd: dir, sandbox: 'read-only' });
+  assert.equal(first.ok, true, `第一轮该成功：${first.error}`);
+
+  // 会话跑着的时候改模型：下一轮必须用新的
+  model = 'o3';
+  const second = await adapter.run({ prompt: 'x', cwd: dir, sandbox: 'read-only' });
+  assert.equal(second.ok, true, `第二轮该成功：${second.error}`);
+
+  const calls = fs.readFileSync(log, 'utf8').trim().split(String.fromCharCode(10));
+  assert.equal(calls.length, 2, `应该跑了两次，实际 ${calls.length}`);
+  assert.match(calls[0], /-m gpt-5\.1-codex/, '第一次要用当时选的模型');
+  assert.match(calls[1], /-m o3/, '改了模型之后，下一次 spawn 就要换过来');
+  assert.doesNotMatch(calls[1], /gpt-5\.1-codex/, '不能还用旧模型');
+});
+
+test('模型留空就不传 -m / --model，交给 CLI 自己的默认值', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-duet-adapters-null-'));
+  const log = path.join(dir, 'args.txt');
+  const bin = path.join(dir, 'fake-codex.sh');
+  fs.writeFileSync(bin, [
+    '#!/bin/sh',
+    `echo "$@" >> "${log}"`,
+    `printf '{"type":"thread.started","thread_id":"th_1"}\\n'`,
+    `echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'`,
+  ].join(String.fromCharCode(10)));
+  fs.chmodSync(bin, 0o755);
+
+  const adapter = createCodexAdapter({ bin, getModel: () => null });
+  await adapter.run({ prompt: 'x', cwd: dir, sandbox: 'read-only' });
+  const args = fs.readFileSync(log, 'utf8');
+  assert.doesNotMatch(args, /(^|\s)-m(\s|$)/, '没选模型就不该传 -m，否则等于替用户拍了一个默认值');
 });

@@ -17,6 +17,9 @@ const state = {
   consensusHistory: [],// 每轮的一致/分歧/阻塞计数，用来画收敛曲线
   stats: { calls: 0, rounds: 0, inTok: 0, outTok: 0, cost: 0 },
   drafts: {},          // agent -> 正在流式的 turn 元素
+  agentModels: {},     // agent -> CLI 自己上报的模型（Claude 会给，Codex 不给）
+  modelConfig: {},     // agent -> 用户配置的模型
+  modelInfo: null,     // /api/models 的结果：建议列表 + 默认值
   turns: {},           // agent -> 已完成的轮次计数
   plan: '',
   running: false,
@@ -285,6 +288,8 @@ function resetBoard() {
   state.lastRound = null;
   state.consensusHistory = [];
   state.stats = { calls: 0, rounds: 0, inTok: 0, outTok: 0, cost: 0 };
+  state.agentModels = {};
+  state.modelConfig = {};
   $('convergence').hidden = true;
   $('convergence').innerHTML = '';
   $('sessionStats').hidden = true;
@@ -407,6 +412,92 @@ function renderSessionMeta() {
   ].filter(Boolean).join('');
 }
 
+/* ------------------------------------------------------------------ */
+/* 模型                                                                */
+/* ------------------------------------------------------------------ */
+
+/** 显示用的模型名：CLI 自己上报的最可信，其次是你选的，最后才是「默认」。 */
+function modelLabel(agent) {
+  if (state.agentModels[agent]) return state.agentModels[agent];
+  if (state.modelConfig[agent]) return state.modelConfig[agent];
+  const dflt = agent === 'codex' ? state.modelInfo?.codex?.default : null;
+  return dflt ? `${dflt}（配置）` : '默认';
+}
+
+function modelTitle(agent) {
+  const lines = [];
+  if (state.agentModels[agent]) lines.push(`CLI 实际上报：${state.agentModels[agent]}`);
+  lines.push(`你选的：${state.modelConfig[agent] || '默认'}`);
+  const dflt = agent === 'codex' ? state.modelInfo?.codex?.default : null;
+  if (dflt) lines.push(`config.toml 里的默认：${dflt}`);
+  lines.push('点击可以改，下一个发言起生效');
+  return lines.join(String.fromCharCode(10));
+}
+
+function renderModelChips() {
+  for (const agent of ['claude', 'codex']) {
+    const el = $(agent === 'claude' ? 'modelClaude' : 'modelCodex');
+    if (!el) continue;
+    el.textContent = modelLabel(agent);
+    el.title = modelTitle(agent);
+    el.classList.toggle('configured', Boolean(state.modelConfig[agent]));
+  }
+}
+
+/**
+ * 下拉选项：默认 + 建议值 + 自定义。
+ *
+ * CLI 没有「列出可用模型」的子命令（codex 的模型目录刷新还会超时），所以列表只能是
+ * 建议值，必须允许手填；用户手填过的值不在列表里，也要能选中并显示出来。
+ */
+function modelOptionsHtml(agent, configured) {
+  const info = state.modelInfo?.[agent] || {};
+  const options = info.options || [{ id: null, label: '默认' }];
+  const known = new Set(options.map((o) => o.id));
+  const html = options.map((o) => {
+    const selected = (configured ?? null) === (o.id ?? null) ? ' selected' : '';
+    const label = o.label || o.id || '默认';
+    return `<option value="${escapeHtml(o.id ?? '')}"${selected}>${escapeHtml(label)}</option>`;
+  }).join('');
+  const extra = configured && !known.has(configured)
+    ? `<option value="${escapeHtml(configured)}" selected>${escapeHtml(configured)}（手填）</option>`
+    : '';
+  return html + extra + '<option value="__custom__">自定义…</option>';
+}
+
+/** 「高级设置」里选中的模型（手填档取输入框的值）。空 = 用默认。 */
+function pickedModel(agent) {
+  const sel = $(agent === 'claude' ? 'claudeModel' : 'codexModel');
+  const custom = $(agent === 'claude' ? 'claudeModelCustom' : 'codexModelCustom');
+  const value = sel.value === '__custom__' ? custom.value.trim() : sel.value;
+  return value || null;
+}
+
+/** 拉一次可选模型填进下拉。拉不到也不致命：还有「默认」和手填两条路。 */
+async function loadModelInfo() {
+  try {
+    state.modelInfo = (await api('/api/models')).models || null;
+  } catch {
+    state.modelInfo = null;
+  }
+  for (const agent of ['claude', 'codex']) {
+    const sel = $(agent === 'claude' ? 'claudeModel' : 'codexModel');
+    if (!sel) continue;
+    const info = state.modelInfo?.[agent] || {};
+    const configured = info.configured ?? null;
+    sel.innerHTML = modelOptionsHtml(agent, configured);
+    const isCustom = Boolean(configured) && !(info.options || []).some((o) => o.id === configured);
+    const custom = $(agent === 'claude' ? 'claudeModelCustom' : 'codexModelCustom');
+    custom.hidden = !isCustom;
+    custom.value = isCustom ? configured : '';
+    const hint = $(agent === 'claude' ? 'claudeModelHint' : 'codexModelHint');
+    if (hint && info.note) hint.textContent = info.note;
+    // 服务端记住的偏好比 localStorage 里的旧表单值权威
+    state.modelConfig[agent] = configured;
+  }
+  renderModelChips();
+}
+
 /**
  * 清掉「正在跑」的视觉残留。
  *
@@ -448,6 +539,12 @@ async function openSession(id) {
     // 写进地址栏：刷新后还停在这个会话，也方便直接把链接发给别人
     history.replaceState(null, '', `#/s/${id}`);
     resetBoard();
+    // 这个会话配置的模型；重放 session 事件时会补上 CLI 实际上报的那个
+    state.modelConfig = {
+      claude: data.meta.settings?.claudeModel ?? null,
+      codex: data.meta.settings?.codexModel ?? null,
+    };
+    renderModelChips();
 
     $('sessionReq').textContent = data.meta.requirement;
     renderSessionMeta();
@@ -543,6 +640,28 @@ function autoscroll(el, wasNear) {
 
 function applyEvent(ev, replay = false) {
   switch (ev.type) {
+    case 'session': {
+      // CLI 自己上报的模型，比「你选的」可信：CLI 可能没接受这个参数，
+      // 也可能把别名解析成了别的模型。所以显示时以它为准。
+      if (ev.model) {
+        state.agentModels[ev.agent] = String(ev.model);
+        renderModelChips();
+      }
+      break;
+    }
+
+    case 'model.changed': {
+      // 换模型不一定马上生效（跑着的时候要等下一个发言），所以如实写清时机
+      state.modelConfig[ev.agent] = ev.model ?? null;
+      renderModelChips();
+      appendLog(
+        `${ev.agent} 换成 ${ev.model || '默认模型'}（${ev.effective === 'next-turn' ? '下一个发言' : '下次继续'}起生效）`,
+        'warn',
+        ev.ts,
+      );
+      break;
+    }
+
     case 'session.start':
       state.running = true;
       $('btnContinue').disabled = true;
@@ -1014,6 +1133,8 @@ $('btnStart').onclick = async () => {
     allowWrite: $('allowWrite').value === 'true',
     sandbox: $('sandbox').value,
     maxFixRounds: Number($('maxFixRounds').value),
+    claudeModel: pickedModel('claude'),
+    codexModel: pickedModel('codex'),
   };
 
   localStorage.setItem('agent-duet-workbench.projectDir', projectDir);
@@ -1165,6 +1286,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   if (!$('guidanceModal').hidden) $('guidanceModal').hidden = true;
   if (!$('continueModal').hidden) $('continueModal').hidden = true;
+  if (!$('modelModal').hidden) $('modelModal').hidden = true;
 });
 $('btnGuidanceSend').onclick = async () => {
   const text = $('guidanceText').value.trim();
@@ -1330,6 +1452,61 @@ try {
   if (s.maxFixRounds != null) $('maxFixRounds').value = s.maxFixRounds;
 } catch { /* 忽略损坏的本地设置 */ }
 
+/* ---------------------------- 换模型 ---------------------------- */
+
+let modelTarget = null;
+
+function openModelModal(agent) {
+  if (!state.sessionId) { toast('先开始一次讨论', 'error'); return; }
+  modelTarget = agent;
+  const info = state.modelInfo?.[agent] || {};
+  const configured = state.modelConfig[agent] ?? info.configured ?? null;
+  $('modelTitle').textContent = agent === 'claude' ? 'Claude 用哪个模型' : 'Codex 用哪个模型';
+  $('modelHint').textContent = '改完从下一个发言起生效：跑着的会话不用停，停下的话下次继续时生效。';
+  $('modelCurrent').textContent = `当前显示：${modelLabel(agent)}（以 CLI 实际上报为准）`;
+  $('modelSelect').innerHTML = modelOptionsHtml(agent, configured);
+  const isCustom = Boolean(configured) && !(info.options || []).some((o) => o.id === configured);
+  $('modelCustom').hidden = !isCustom;
+  $('modelCustom').value = isCustom ? configured : '';
+  $('modelNote').textContent = info.note || '';
+  $('modelModal').hidden = false;
+  $('modelSelect').focus();
+}
+
+$('modelSelect').onchange = () => {
+  $('modelCustom').hidden = $('modelSelect').value !== '__custom__';
+};
+$('btnModelCancel').onclick = () => { $('modelModal').hidden = true; };
+$('modelClaude').onclick = () => openModelModal('claude');
+$('modelCodex').onclick = () => openModelModal('codex');
+$('btnModelSave').onclick = async () => {
+  if (!state.sessionId || !modelTarget) return;
+  const raw = $('modelSelect').value === '__custom__'
+    ? $('modelCustom').value.trim()
+    : $('modelSelect').value;
+  try {
+    const r = await api(`/api/sessions/${state.sessionId}/model`, {
+      method: 'POST',
+      body: JSON.stringify({ agent: modelTarget, model: raw }),
+    });
+    state.modelConfig[modelTarget] = r.model ?? null;
+    renderModelChips();
+    toast(r.message || '已更新模型', 'ok');
+    $('modelModal').hidden = true;
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+};
+
+// 选到「自定义」就露出输入框
+for (const id of ['claudeModel', 'codexModel']) {
+  $(id).onchange = () => {
+    const customId = id === 'claudeModel' ? 'claudeModelCustom' : 'codexModelCustom';
+    $(customId).hidden = $(id).value !== '__custom__';
+  };
+}
+
+loadModelInfo();
 loadHealth();
 loadSessions();
 
