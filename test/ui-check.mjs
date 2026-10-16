@@ -70,6 +70,8 @@ const meta = store.createSession({
 // 合成一段事件流：覆盖每一类渲染分支
 const ev = (e) => store.appendEvent(SESSION_ID, e);
 ev({ type: 'session.start', requirement: meta.requirement, projectDir: tmp, leadAgent: 'claude', peerAgent: 'codex' });
+// CLI 上报它实际用的模型：列头显示的应当是这个值，而不是笼统的「默认」
+ev({ type: 'session', agent: 'claude', phase: 'propose', round: 1, sessionId: 'sess-claude-1', model: 'claude-opus-5-5' });
 ev({ type: 'phase', phase: 'propose', round: 1, label: '独立作答' });
 ev({ type: 'turn.start', agent: 'claude', phase: 'propose', round: 1 });
 ev({ type: 'tool', agent: 'claude', phase: 'propose', round: 1, name: 'Read', detail: 'index.html', state: 'done' });
@@ -967,6 +969,12 @@ await sleep(2000);
     chip.label.length > 0 && chip.codexLabel.length > 0, JSON.stringify(chip));
   check('下拉里带上了候选模型与「自定义…」',
     chip.options.length >= 2 && chip.options.includes('__custom__'), JSON.stringify(chip.options));
+  check('列头显示的是 CLI 实际上报的模型，不是笼统的「默认」',
+    chip.label.includes('claude-opus-5-5'), JSON.stringify(chip.label));
+  // 这条钉住一个真出过的 bug：回放历史时 session.start 把 running 置了 true，
+  // 而收尾没有再画一次标签，于是早就停下的会话一直显示「正在用」
+  check('已经停下的会话不说「正在用」',
+    !chip.label.includes('正在用'), JSON.stringify(chip.label));
   check('模型下拉真的显示出来了（不是隐藏或零尺寸）', chip.visible === true, JSON.stringify(chip));
   // 看得见还得点得着：曾经有按钮被别的元素盖住，DOM 正常但点不到
   check('模型下拉点得到（命中测试）', chip.hit === true, JSON.stringify(chip));

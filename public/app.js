@@ -416,10 +416,21 @@ function renderSessionMeta() {
 /* 模型                                                                */
 /* ------------------------------------------------------------------ */
 
-/** 显示用的模型名：CLI 自己上报的最可信，其次是你选的，最后才是「默认」。 */
+/**
+ * 下拉/弹窗该显示哪个模型。
+ *
+ * **你明确选过的优先**，没选过才回落到 CLI 上报的实际值 —— 那正好回答「默认到底是哪个模型」。
+ * 反过来（实际优先）会出问题：刚改完、CLI 还没按新模型跑过，界面却还显示上一个，
+ * 看着就像没改成功。两者不一致时的差异由 tooltip 说明。
+ */
+function modelSelectedValue(agent) {
+  return state.modelConfig[agent] ?? state.agentModels[agent] ?? null;
+}
+
+/** 显示用的模型名：与下拉同一套优先级，避免弹窗和列头各说一套。 */
 function modelLabel(agent) {
-  if (state.agentModels[agent]) return state.agentModels[agent];
-  if (state.modelConfig[agent]) return state.modelConfig[agent];
+  const selected = modelSelectedValue(agent);
+  if (selected) return selected;
   const dflt = agent === 'codex' ? state.modelInfo?.codex?.default : null;
   return dflt ? `${dflt}（配置）` : '默认';
 }
@@ -437,8 +448,8 @@ function modelTitle(agent) {
 /**
  * 列头下拉的选项：真实候选 + 「你选的 / 正在用」兜底项 + 自定义。
  *
- * 选中项以 **CLI 实际上报的模型**为准（那是真的在用的那个）；CLI 不上报（codex 就不上报）
- * 才退回显示你选的。这样这个下拉既回答了「现在用的哪个」，本身又是换模型的入口。
+ * 选中项 = 你选的那个；没选过才显示 CLI 上报的实际值。所以它既回答了「现在用的哪个」，
+ * 本身又是换模型的入口。
  */
 function colModelOptionsHtml(agent) {
   const info = state.modelInfo?.[agent] || {};
@@ -455,7 +466,7 @@ function colModelOptionsHtml(agent) {
     list.push({ id: actual, label: `${actual}（${state.running ? '正在用' : '上次用的'}）` });
     known.add(actual);
   }
-  const selected = actual && known.has(actual) ? actual : configured;
+  const selected = modelSelectedValue(agent);
   const html = list.map((o) => {
     const value = o.id == null ? '' : String(o.id);
     const isSel = (o.id ?? null) === (selected ?? null) ? ' selected' : '';
@@ -475,10 +486,10 @@ function renderModelChips() {
 }
 
 /**
- * 下拉选项：默认 + 建议值 + 自定义。
+ * 下拉选项：默认 + 自动带进来的候选 + 自定义。
  *
- * CLI 没有「列出可用模型」的子命令（codex 的模型目录刷新还会超时），所以列表只能是
- * 建议值，必须允许手填；用户手填过的值不在列表里，也要能选中并显示出来。
+ * 候选不一定列全（claude 就没有列模型的子命令），所以必须允许手填；
+ * 用户手填过的值不在候选里，也要能选中并显示出来。
  */
 function modelOptionsHtml(agent, configured) {
   const info = state.modelInfo?.[agent] || {};
@@ -694,6 +705,7 @@ function applyEvent(ev, replay = false) {
 
     case 'session.start':
       state.running = true;
+      renderModelChips();
       $('btnContinue').disabled = true;
       $('btnComplete').hidden = true;
       break;
@@ -1096,6 +1108,8 @@ async function refreshDiff() {
 
 function finishSession(status, outcome, replay = false) {
   state.running = false;
+  // 「正在用 / 上次用的」取决于在不在跑，这里状态刚变，标签得跟着重画
+  renderModelChips();
   $('btnRollback').hidden = !state.meta?.baseSha;
   $('btnStop').disabled = true;
   // 停下来了也留着插话：那颗按钮变灰等于把用户刚打的话丢掉
@@ -1493,7 +1507,12 @@ function openModelModal(agent) {
   const configured = state.modelConfig[agent] ?? info.configured ?? null;
   $('modelTitle').textContent = agent === 'claude' ? 'Claude 用哪个模型' : 'Codex 用哪个模型';
   $('modelHint').textContent = '改完从下一个发言起生效：跑着的会话不用停，停下的话下次继续时生效。';
-  $('modelCurrent').textContent = `当前显示：${modelLabel(agent)}（以 CLI 实际上报为准）`;
+  const actualNow = state.agentModels[agent] || null;
+  const label = modelLabel(agent);
+  // CLI 上一轮实际报的是另一个时要说清，否则「我改的到底生效没有」没法判断
+  $('modelCurrent').textContent = actualNow && actualNow !== label
+    ? `当前显示：${label}；CLI 上一次上报的是 ${actualNow}`
+    : `当前显示：${label}`;
   $('modelSelect').innerHTML = modelOptionsHtml(agent, configured);
   const isCustom = Boolean(configured) && !(info.options || []).some((o) => o.id === configured);
   $('modelCustom').hidden = !isCustom;
